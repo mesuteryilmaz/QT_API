@@ -46,6 +46,8 @@ namespace MBO_Market_Data_Analytics
         public readonly AggressorFlag Aggressor;
         public readonly DateTime Time;
         public readonly bool Closed;
+        public readonly long Priority;      // Level2Quote.Priority (MBO queue rank; 0 if unavailable)
+        public readonly int NumberOrders;   // Level2Quote.NumberOrders (>1 means aggregated feed)
 
         public MarketEvent(DateTime time, double price, double size, AggressorFlag aggressor)
         {
@@ -57,9 +59,12 @@ namespace MBO_Market_Data_Analytics
             Id = null;
             IsBid = false;
             Closed = false;
+            Priority = 0;
+            NumberOrders = 0;
         }
 
-        public MarketEvent(DateTime time, string id, double price, double size, bool isBid, bool closed)
+        public MarketEvent(DateTime time, string? id, double price, double size, bool isBid, bool closed,
+                           long priority = 0, int numberOrders = 0)
         {
             Kind = MarketEventKind.BookLevel;
             Time = time;
@@ -69,6 +74,8 @@ namespace MBO_Market_Data_Analytics
             IsBid = isBid;
             Closed = closed;
             Aggressor = AggressorFlag.None;
+            Priority = priority;
+            NumberOrders = numberOrders;
         }
     }
 

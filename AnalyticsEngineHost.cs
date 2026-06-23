@@ -59,6 +59,11 @@ namespace MBO_Market_Data_Analytics
         private volatile bool isBookValid = false;
         private volatile bool initialized = false;
 
+        // Order-level book used when MboMode is active. Normalises raw Level2Quote events into
+        // typed MboEvent objects (Add/Update/Remove) on the worker thread before passing them to
+        // the calculator, enabling exact per-order arrival/cancel/spoof tracking.
+        private MboOrderBook? mboBook;
+
         private DateTime lastSessionDate = DateTime.MinValue;
 
         public bool IsBookValid => isBookValid;
@@ -103,9 +108,10 @@ namespace MBO_Market_Data_Analytics
                 Calculator.AbsorptionVolumeThreshold = config.AbsorptionThreshold;
 
             // Always attempt MBO mode. SeedBookSnapshot downgrades to MBP if the feed returns
-            // no per-order snapshot, and ProcessLevel2Mbo falls back to price-level keys when
-            // Level2Quote.Id is null/empty — so MBP feeds are handled transparently.
+            // no per-order snapshot, and ProcessMboEvent falls back gracefully when order IDs
+            // are absent — so MBP feeds are handled transparently.
             Calculator.MboMode = true;
+            mboBook = new MboOrderBook(symbol.TickSize);
 
             SeedBookSnapshot();
             PublishSnapshot();
@@ -141,6 +147,7 @@ namespace MBO_Market_Data_Analytics
 
             Calculator?.Reset();
             Calculator = null;
+            mboBook = null;
         }
 
         #endregion
@@ -259,13 +266,24 @@ namespace MBO_Market_Data_Analytics
                     }
                     else
                     {
+                        DateTime seedTime = DateTime.UtcNow;
                         int bc = 0, ac = 0;
                         if (snap.Bids != null)
                             foreach (var b in snap.Bids)
-                                if (b?.Id != null) { Calculator.ProcessLevel2ItemMbo(b.Id, b.Price, b.Size, true); bc++; }
+                                if (b?.Id != null)
+                                {
+                                    Calculator.ProcessLevel2ItemMbo(b.Id, b.Price, b.Size, true);
+                                    mboBook?.ApplySnapshot(seedTime, b.Id, true, b.Price, b.Size, b.Priority, b.NumberOrders);
+                                    bc++;
+                                }
                         if (snap.Asks != null)
                             foreach (var a in snap.Asks)
-                                if (a?.Id != null) { Calculator.ProcessLevel2ItemMbo(a.Id, a.Price, a.Size, false); ac++; }
+                                if (a?.Id != null)
+                                {
+                                    Calculator.ProcessLevel2ItemMbo(a.Id, a.Price, a.Size, false);
+                                    mboBook?.ApplySnapshot(seedTime, a.Id, false, a.Price, a.Size, a.Priority, a.NumberOrders);
+                                    ac++;
+                                }
                         isBookValid = true;
                         log($"MBO book seeded: {bc} bid orders, {ac} ask orders tracked.", LoggingLevel.System);
                         return;
@@ -315,7 +333,8 @@ namespace MBO_Market_Data_Analytics
         {
             if (!initialized || eventQueue == null || level2 == null) return;
             bool isBid = level2.PriceType == QuotePriceType.Bid;
-            EnqueueEvent(new MarketEvent(DateTime.UtcNow, level2.Id, level2.Price, level2.Size, isBid, level2.Closed));
+            EnqueueEvent(new MarketEvent(DateTime.UtcNow, level2.Id, level2.Price, level2.Size, isBid, level2.Closed,
+                                         level2.Priority, level2.NumberOrders));
         }
 
         private void EnqueueEvent(MarketEvent evt)
@@ -393,11 +412,21 @@ namespace MBO_Market_Data_Analytics
 
             if (evt.Kind == MarketEventKind.Trade)
                 Calculator.ProcessTrade(evt.Time, evt.Price, evt.Size, evt.Aggressor);
-            else if (evt.Kind == MarketEventKind.BookLevel && evt.Id != null)
+            else if (evt.Kind == MarketEventKind.BookLevel)
             {
-                Calculator.ProcessLevel2(evt.Time, evt.Id, evt.Price, evt.Size, evt.IsBid, evt.Closed);
-                // If the initial snapshot seed was skipped (e.g. L2 feed not yet active at startup),
-                // mark the book valid on the first live L2 event — the live stream will populate it.
+                if (Calculator.MboMode && mboBook != null)
+                {
+                    // Normalise raw quote into a typed MboEvent (Add/Update/Remove) and process
+                    // via the order-ID-aware pipeline for exact arrival/cancel/spoof tracking.
+                    var mboEvent = mboBook.Apply(evt.Time, evt.Id, evt.IsBid, evt.Price, evt.Size,
+                                                 evt.Priority, evt.NumberOrders, evt.Closed);
+                    Calculator.ProcessMboEvent(mboEvent);
+                }
+                else
+                {
+                    Calculator.ProcessLevel2(evt.Time, evt.Id, evt.Price, evt.Size, evt.IsBid, evt.Closed);
+                }
+
                 if (!isBookValid)
                 {
                     isBookValid = true;
@@ -416,6 +445,7 @@ namespace MBO_Market_Data_Analytics
                 while (eventQueue.TryTake(out _)) { }
 
             Calculator?.ResetBookStateOnly();
+            mboBook?.Clear();
             isBookValid = false;
 
             try
@@ -433,17 +463,29 @@ namespace MBO_Market_Data_Analytics
                     {
                         log("MBO recovery snapshot returned null — downgrading to MBP mode.", LoggingLevel.System);
                         Calculator.MboMode = false;
+                        mboBook = null;
                         // fall through to MBP path below
                     }
                     else
                     {
+                        DateTime seedTime = DateTime.UtcNow;
                         int bc = 0, ac = 0;
                         if (snap.Bids != null)
                             foreach (var b in snap.Bids)
-                                if (b?.Id != null) { Calculator.ProcessLevel2ItemMbo(b.Id, b.Price, b.Size, true); bc++; }
+                                if (b?.Id != null)
+                                {
+                                    Calculator.ProcessLevel2ItemMbo(b.Id, b.Price, b.Size, true);
+                                    mboBook?.ApplySnapshot(seedTime, b.Id, true, b.Price, b.Size, b.Priority, b.NumberOrders);
+                                    bc++;
+                                }
                         if (snap.Asks != null)
                             foreach (var a in snap.Asks)
-                                if (a?.Id != null) { Calculator.ProcessLevel2ItemMbo(a.Id, a.Price, a.Size, false); ac++; }
+                                if (a?.Id != null)
+                                {
+                                    Calculator.ProcessLevel2ItemMbo(a.Id, a.Price, a.Size, false);
+                                    mboBook?.ApplySnapshot(seedTime, a.Id, false, a.Price, a.Size, a.Priority, a.NumberOrders);
+                                    ac++;
+                                }
                         isBookValid = true;
                         log($"Queue Overflow Recovery complete. MBO book rebuilt: {bc} bid orders, {ac} ask orders.", LoggingLevel.System);
                         isQueueOverflowed = false;

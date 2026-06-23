@@ -179,6 +179,10 @@ namespace MBO_Market_Data_Analytics
         private sealed class MboLevelRef { public long Ticks; public double Size; public bool IsBid; }
         private readonly Dictionary<string, MboLevelRef> mboOrders = new Dictionary<string, MboLevelRef>();
 
+        // Fast lookup for spoof detection in MBO mode: orderId → the L2AdditionTracker recorded when
+        // the order was added. Enables exact add→cancel matching without a price+time heuristic.
+        private readonly Dictionary<string, L2AdditionTracker> mboAddByOrderId = new Dictionary<string, L2AdditionTracker>();
+
         // Incremental best bid/ask (maintained in both modes; used by microprice + OFI).
         private bool hasBestBid, hasBestAsk;
         private long bestBidTicks, bestAskTicks;
@@ -323,83 +327,155 @@ namespace MBO_Market_Data_Analytics
             ProcessLevel2(Core.Instance.TimeUtils.DateTimeUtcNow, quote.Id, quote.Price, quote.Size, isBid, quote.Closed);
         }
 
-        public void ProcessLevel2(DateTime time, string id, double price, double size, bool isBid, bool closed)
+        public void ProcessLevel2(DateTime time, string? id, double price, double size, bool isBid, bool closed)
         {
-            if (price <= 0)
-                return;
+            // MBP path only. In MBO mode the host routes events through ProcessMboEvent instead.
+            if (price <= 0) return;
 
             lock (locker)
             {
                 AdvanceTo(time.Ticks);
 
                 if (!IsCalibrated)
-                {
                     calibrationL2MessagesCount++;
-                }
 
-                // OrderBook Reset signal
                 if (closed && string.Equals(id, "FLUSH", StringComparison.OrdinalIgnoreCase))
-                {
-                    Reset();
-                    return;
-                }
+                { Reset(); return; }
 
-                // Snapshot the best quotes before the update so OFI can be accumulated from the change.
                 bool pHasBid = hasBestBid, pHasAsk = hasBestAsk;
                 long pBidT = bestBidTicks, pAskT = bestAskTicks;
                 double pBidSz = bestBidSize, pAskSz = bestAskSize;
 
-                if (MboMode)
+                long priceTicks = (long)Math.Round(price / symbol.TickSize);
+                var book = isBid ? bidBook : askBook;
+                double newQty = closed ? 0 : size;
+
+                if (book.TryGetValue(priceTicks, out double previousQty))
                 {
-                    ProcessLevel2Mbo(time, id, price, size, isBid, closed);
-                }
-                else
-                {
-                    long priceTicks = (long)Math.Round(price / symbol.TickSize);
-                    var book = isBid ? bidBook : askBook;
-
-                    double previousQty = 0;
-                    double newQty = closed ? 0 : size;
-
-                    bool exists = book.TryGetValue(priceTicks, out previousQty);
-
-                    if (exists)
+                    if (newQty <= 0)
                     {
-                        if (newQty <= 0)
-                        {
-                            book.Remove(priceTicks);
-                            if (previousQty > 0)
-                            {
-                                HandleL2Reduction(time, price, previousQty, isBid);
-                            }
-                        }
-                        else if (newQty < previousQty)
-                        {
-                            double removedQty = previousQty - newQty;
-                            book[priceTicks] = newQty;
-                            HandleL2Reduction(time, price, removedQty, isBid);
-                        }
-                        else if (newQty > previousQty)
-                        {
-                            double addedQty = newQty - previousQty;
-                            book[priceTicks] = newQty;
-                            RecordL2Addition(time, price, addedQty, isBid);
-                        }
+                        book.Remove(priceTicks);
+                        if (previousQty > 0) HandleL2Reduction(time, price, previousQty, isBid);
                     }
-                    else if (newQty > 0)
+                    else if (newQty < previousQty)
                     {
                         book[priceTicks] = newQty;
-                        RecordL2Addition(time, price, newQty, isBid);
+                        HandleL2Reduction(time, price, previousQty - newQty, isBid);
                     }
+                    else if (newQty > previousQty)
+                    {
+                        book[priceTicks] = newQty;
+                        RecordL2Addition(time, price, newQty - previousQty, isBid);
+                    }
+                }
+                else if (newQty > 0)
+                {
+                    book[priceTicks] = newQty;
+                    RecordL2Addition(time, price, newQty, isBid);
+                }
 
-                    double finalTotal = book.TryGetValue(priceTicks, out var ft) ? ft : 0;
-                    UpdateBest(isBid, priceTicks, finalTotal);
+                UpdateBest(isBid, priceTicks, book.TryGetValue(priceTicks, out var ft) ? ft : 0);
+                AccumulateOfi(pHasBid, pBidT, pBidSz, pHasAsk, pAskT, pAskSz);
+                PruneUnmatchedTrades(time);
+                PruneMicrostructureCollections(time);
+            }
+        }
+
+        /// <summary>
+        /// Processes a normalized MBO event produced by the host's MboOrderBook. This is the primary
+        /// L2 entry point when MboMode is active. Unlike ProcessLevel2, it receives a pre-classified
+        /// action (Add/Update/Remove) and the stable order ID, enabling exact per-order spoof detection
+        /// and accurate arrival/cancel counting without price+time heuristics.
+        /// </summary>
+        public void ProcessMboEvent(MboEvent evt)
+        {
+            if (evt.Price <= 0) return;
+            if (evt.Action == MboAction.Trade || evt.Action == MboAction.Snapshot) return;
+
+            lock (locker)
+            {
+                AdvanceTo(evt.Time.Ticks);
+
+                if (evt.Action == MboAction.Remove &&
+                    string.Equals(evt.OrderId, "FLUSH", StringComparison.OrdinalIgnoreCase))
+                { Reset(); return; }
+
+                if (!IsCalibrated)
+                    calibrationL2MessagesCount++;
+
+                bool pHasBid = hasBestBid, pHasAsk = hasBestAsk;
+                long pBidT = bestBidTicks, pAskT = bestAskTicks;
+                double pBidSz = bestBidSize, pAskSz = bestAskSize;
+
+                double ts = symbol.TickSize > 0 ? symbol.TickSize : 1.0;
+                long tick = (long)Math.Round(evt.Price / ts);
+                bool isBid = evt.IsBid;
+                string orderId = evt.OrderId;
+
+                switch (evt.Action)
+                {
+                    case MboAction.Add:
+                    {
+                        double nt = ApplyPriceLevelDelta(isBid, tick, evt.Size);
+                        mboOrders[orderId] = new MboLevelRef { Ticks = tick, Size = evt.Size, IsBid = isBid };
+                        UpdateBest(isBid, tick, nt);
+                        RecordL2Addition(evt.Time, evt.Price, evt.Size, isBid, orderId);
+                        break;
+                    }
+                    case MboAction.Update:
+                    {
+                        if (mboOrders.TryGetValue(orderId, out var existing))
+                        {
+                            if (existing.Ticks == tick && existing.IsBid == isBid)
+                            {
+                                double delta = evt.Size - existing.Size;
+                                if (delta != 0)
+                                {
+                                    double nt = ApplyPriceLevelDelta(isBid, tick, delta);
+                                    existing.Size = evt.Size;
+                                    UpdateBest(isBid, tick, nt);
+                                    if (delta > 0) RecordL2Addition(evt.Time, evt.Price, delta, isBid, orderId);
+                                    else HandleL2Reduction(evt.Time, evt.Price, -delta, isBid, orderId);
+                                }
+                            }
+                            else
+                            {
+                                // Order moved price or side: remove from old level, add at new
+                                double oldTotal = ApplyPriceLevelDelta(existing.IsBid, existing.Ticks, -existing.Size);
+                                UpdateBest(existing.IsBid, existing.Ticks, oldTotal);
+                                HandleL2Reduction(evt.Time, existing.Ticks * ts, existing.Size, existing.IsBid, orderId);
+                                double newTotal = ApplyPriceLevelDelta(isBid, tick, evt.Size);
+                                existing.Ticks = tick; existing.Size = evt.Size; existing.IsBid = isBid;
+                                UpdateBest(isBid, tick, newTotal);
+                                RecordL2Addition(evt.Time, evt.Price, evt.Size, isBid, orderId);
+                            }
+                        }
+                        else
+                        {
+                            // Unseen order: treat as Add
+                            double nt = ApplyPriceLevelDelta(isBid, tick, evt.Size);
+                            mboOrders[orderId] = new MboLevelRef { Ticks = tick, Size = evt.Size, IsBid = isBid };
+                            UpdateBest(isBid, tick, nt);
+                            RecordL2Addition(evt.Time, evt.Price, evt.Size, isBid, orderId);
+                        }
+                        break;
+                    }
+                    case MboAction.Remove:
+                    {
+                        if (mboOrders.TryGetValue(orderId, out var o))
+                        {
+                            double nt = ApplyPriceLevelDelta(o.IsBid, o.Ticks, -o.Size);
+                            mboOrders.Remove(orderId);
+                            UpdateBest(o.IsBid, o.Ticks, nt);
+                            HandleL2Reduction(evt.Time, o.Ticks * ts, o.Size, o.IsBid, orderId);
+                        }
+                        break;
+                    }
                 }
 
                 AccumulateOfi(pHasBid, pBidT, pBidSz, pHasAsk, pAskT, pAskSz);
-
-                PruneUnmatchedTrades(time);
-                PruneMicrostructureCollections(time);
+                PruneUnmatchedTrades(evt.Time);
+                PruneMicrostructureCollections(evt.Time);
             }
         }
 
@@ -551,6 +627,7 @@ namespace MBO_Market_Data_Analytics
         private void ClearBookDerivedState()
         {
             mboOrders.Clear();
+            mboAddByOrderId.Clear();
             hasBestBid = hasBestAsk = false;
             bestBidTicks = bestAskTicks = 0;
             bestBidSize = bestAskSize = 0;
@@ -638,60 +715,6 @@ namespace MBO_Market_Data_Analytics
             }
         }
 
-        // Order-level (MBO) book maintenance. Keeps the order-keyed map and the price aggregates
-        // (bidBook/askBook + best) in sync, and feeds the SAME arrival/cancel/spoof machinery as the
-        // MBP path — so those metrics become order-accurate, with no new getters required.
-        private void ProcessLevel2Mbo(DateTime time, string? id, double price, double size, bool isBid, bool closed)
-        {
-            double ts = symbol.TickSize > 0 ? symbol.TickSize : 1.0;
-            long tick = (long)Math.Round(price / ts);
-            string key = string.IsNullOrEmpty(id) ? (isBid ? "B:" : "A:") + tick.ToString() : id!;
-
-            if (closed || size <= 0)
-            {
-                if (mboOrders.TryGetValue(key, out var o))
-                {
-                    double newTotal = ApplyPriceLevelDelta(o.IsBid, o.Ticks, -o.Size);
-                    mboOrders.Remove(key);
-                    UpdateBest(o.IsBid, o.Ticks, newTotal);
-                    HandleL2Reduction(time, o.Ticks * ts, o.Size, o.IsBid);
-                }
-                return;
-            }
-
-            if (mboOrders.TryGetValue(key, out var ord))
-            {
-                if (ord.Ticks == tick && ord.IsBid == isBid)
-                {
-                    double delta = size - ord.Size;
-                    double nt = ApplyPriceLevelDelta(isBid, tick, delta);
-                    ord.Size = size;
-                    UpdateBest(isBid, tick, nt);
-                    if (delta > 0) RecordL2Addition(time, price, delta, isBid);
-                    else if (delta < 0) HandleL2Reduction(time, price, -delta, isBid);
-                }
-                else
-                {
-                    // Order moved price/side: remove from old level, add at new.
-                    double oldTotal = ApplyPriceLevelDelta(ord.IsBid, ord.Ticks, -ord.Size);
-                    UpdateBest(ord.IsBid, ord.Ticks, oldTotal);
-                    HandleL2Reduction(time, ord.Ticks * ts, ord.Size, ord.IsBid);
-
-                    double newTotal = ApplyPriceLevelDelta(isBid, tick, size);
-                    ord.Ticks = tick; ord.Size = size; ord.IsBid = isBid;
-                    UpdateBest(isBid, tick, newTotal);
-                    RecordL2Addition(time, price, size, isBid);
-                }
-            }
-            else
-            {
-                double nt = ApplyPriceLevelDelta(isBid, tick, size);
-                mboOrders[key] = new MboLevelRef { Ticks = tick, Size = size, IsBid = isBid };
-                UpdateBest(isBid, tick, nt);
-                RecordL2Addition(time, price, size, isBid);
-            }
-        }
-
         private double ApplyPriceLevelDelta(bool isBid, long tick, double delta)
         {
             var book = isBid ? bidBook : askBook;
@@ -771,16 +794,20 @@ namespace MBO_Market_Data_Analytics
             }
         }
 
-        private void RecordL2Addition(DateTime time, double price, double size, bool isBid)
+        private void RecordL2Addition(DateTime time, double price, double size, bool isBid, string? orderId = null)
         {
             l2Agg.AddAddition(time.Ticks, size, isBid);
             totalArrivedOrderCount++;
             totalArrivedOrderQty += size;
 
-            // Track recent additions for spoofing heuristics
-            recentAdditions.Add(new L2AdditionTracker(time, price, size, isBid));
+            var tracker = new L2AdditionTracker(time, price, size, isBid, orderId);
+            recentAdditions.Add(tracker);
 
-            // Replenishment heuristic check
+            // In MBO mode register by order ID for O(1) spoof lookup in HandleL2Reduction.
+            if (MboMode && !string.IsNullOrEmpty(orderId))
+                mboAddByOrderId[orderId] = tracker;
+
+            // Replenishment: new order added at a price where an execution happened recently.
             var matchedExec = recentExecutions.FirstOrDefault(x =>
                 Math.Abs(x.Price - price) < 1e-9 &&
                 x.IsBid == isBid &&
@@ -793,7 +820,7 @@ namespace MBO_Market_Data_Analytics
             }
         }
 
-        private void HandleL2Reduction(DateTime time, double price, double reductionSize, bool isBid)
+        private void HandleL2Reduction(DateTime time, double price, double reductionSize, bool isBid, string? orderId = null)
         {
             double matchTradeQty = 0;
             AggressorFlag expectedAggressor = isBid ? AggressorFlag.Sell : AggressorFlag.Buy;
@@ -805,12 +832,9 @@ namespace MBO_Market_Data_Analytics
                 {
                     double needed = reductionSize - matchTradeQty;
                     double matched = Math.Min(needed, trade.RemainingQty);
-
                     trade.RemainingQty -= matched;
                     matchTradeQty += matched;
-
-                    if (matchTradeQty >= reductionSize)
-                        break;
+                    if (matchTradeQty >= reductionSize) break;
                 }
             }
 
@@ -824,12 +848,10 @@ namespace MBO_Market_Data_Analytics
             if (cancelledQty > 0)
             {
                 totalCancelledOrderQty += cancelledQty;
-
                 if (isBid)
                 {
                     totalCancelledBuyOrderCount++;
                     totalCancelledBuyOrderQty += cancelledQty;
-
                     sessionCancelBuyVwapSumPriceQty += (price * cancelledQty);
                     sessionCancelBuyVwapQty += cancelledQty;
                 }
@@ -837,26 +859,45 @@ namespace MBO_Market_Data_Analytics
                 {
                     totalCancelledSellOrderCount++;
                     totalCancelledSellOrderQty += cancelledQty;
-
                     sessionCancelSellVwapSumPriceQty += (price * cancelledQty);
                     sessionCancelSellVwapQty += cancelledQty;
                 }
-
                 sessionCancelVwapSumPriceQty += (price * cancelledQty);
                 sessionCancelVwapQty += cancelledQty;
 
-                // Spoofing heuristic check (addition removed < 1000ms with no execution)
-                var matchAdd = recentAdditions.FirstOrDefault(a =>
-                    Math.Abs(a.Price - price) < 1e-9 &&
-                    a.IsBid == isBid &&
-                    (time - a.Time).TotalMilliseconds <= 1000.0 &&
-                    !a.HadTrades);
+                // Spoof detection.
+                // MBO mode: look up the exact order that was added — no price+time ambiguity.
+                // MBP mode: fall back to the price+time heuristic.
+                L2AdditionTracker? matchAdd;
+                if (MboMode && !string.IsNullOrEmpty(orderId))
+                {
+                    if (mboAddByOrderId.TryGetValue(orderId, out var addRecord) &&
+                        !addRecord.HadTrades &&
+                        (time - addRecord.Time).TotalMilliseconds <= 1000.0)
+                    {
+                        matchAdd = addRecord;
+                        mboAddByOrderId.Remove(orderId);
+                        recentAdditions.Remove(matchAdd);
+                    }
+                    else
+                    {
+                        matchAdd = null;
+                    }
+                }
+                else
+                {
+                    matchAdd = recentAdditions.FirstOrDefault(a =>
+                        Math.Abs(a.Price - price) < 1e-9 &&
+                        a.IsBid == isBid &&
+                        (time - a.Time).TotalMilliseconds <= 1000.0 &&
+                        !a.HadTrades);
+                    if (matchAdd != null) recentAdditions.Remove(matchAdd);
+                }
 
                 if (matchAdd != null)
                 {
                     spoofEvents.Enqueue(new SpoofEvent(time, cancelledQty, isBid));
                     if (isBid) _spoofBidSum += cancelledQty; else _spoofAskSum += cancelledQty;
-                    recentAdditions.Remove(matchAdd);
                 }
             }
         }
@@ -868,7 +909,12 @@ namespace MBO_Market_Data_Analytics
 
         private void PruneMicrostructureCollections(DateTime time)
         {
-            recentAdditions.RemoveAll(x => (time - x.Time).TotalMilliseconds > 5000.0);
+            recentAdditions.RemoveAll(x =>
+            {
+                bool expired = (time - x.Time).TotalMilliseconds > 5000.0;
+                if (expired && x.OrderId != null) mboAddByOrderId.Remove(x.OrderId);
+                return expired;
+            });
             recentExecutions.RemoveAll(x => (time - x.Time).TotalMilliseconds > 5000.0);
 
             while (icebergEvents.Count > 0 && (time - icebergEvents.Peek().Time).TotalSeconds > 60)
@@ -1643,14 +1689,16 @@ private MetricValue CalculateImbalance(int levels)
             public double Qty { get; }
             public bool IsBid { get; }
             public bool HadTrades { get; set; }
+            public string? OrderId { get; }  // set in MBO mode; null in MBP mode
 
-            public L2AdditionTracker(DateTime time, double price, double qty, bool isBid)
+            public L2AdditionTracker(DateTime time, double price, double qty, bool isBid, string? orderId = null)
             {
                 Time = time;
                 Price = price;
                 Qty = qty;
                 IsBid = isBid;
                 HadTrades = false;
+                OrderId = orderId;
             }
         }
 

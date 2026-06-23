@@ -176,6 +176,9 @@ namespace MBO_Market_Data_Analytics
         // arrival/cancel/spoof metrics order-accurate. Default false preserves the price-aggregated path.
         public bool MboMode { get; set; } = false;
 
+        /// <summary>True once at least one bid and one ask have been processed — minimum two-sided BBO validity check.</summary>
+        public bool HasTwoSidedBook => hasBestBid && hasBestAsk;
+
         private sealed class MboLevelRef { public long Ticks; public double Size; public bool IsBid; }
         private readonly Dictionary<string, MboLevelRef> mboOrders = new Dictionary<string, MboLevelRef>();
 

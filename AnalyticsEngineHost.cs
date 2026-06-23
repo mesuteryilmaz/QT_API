@@ -369,7 +369,12 @@ namespace MBO_Market_Data_Analytics
                     if (eventQueue.TryTake(out MarketEvent evt, 10, token))
                     {
                         if (isQueueOverflowed)
+                        {
+                            // Discard the already-dequeued event — it belongs to the pre-overflow
+                            // epoch and must not be applied to the freshly rebuilt book.
                             RecoverFromOverflow();
+                            continue;
+                        }
 
                         ProcessEventOnWorker(evt);
                         dirty = true;
@@ -427,10 +432,12 @@ namespace MBO_Market_Data_Analytics
                     Calculator.ProcessLevel2(evt.Time, evt.Id, evt.Price, evt.Size, evt.IsBid, evt.Closed);
                 }
 
-                if (!isBookValid)
+                // Require both bid and ask sides before declaring the book valid.
+                // A single incremental update cannot establish a complete book.
+                if (!isBookValid && Calculator.HasTwoSidedBook)
                 {
                     isBookValid = true;
-                    log("L2 book validated from live stream (initial snapshot was unavailable at startup).", LoggingLevel.System);
+                    log("L2 book bootstrapped from live stream (both sides now present).", LoggingLevel.System);
                 }
             }
 
@@ -518,7 +525,11 @@ namespace MBO_Market_Data_Analytics
                 log("Queue Overflow Recovery failed snapshot request: " + ex.Message, LoggingLevel.Error);
             }
 
-            isQueueOverflowed = false;
+            // Only clear the overflow flag when a snapshot actually rebuilt the book.
+            // If the snapshot call failed or returned null, leave isQueueOverflowed=true so
+            // the next event triggers another recovery attempt rather than re-entering normal
+            // processing against an invalid book.
+            if (isBookValid) isQueueOverflowed = false;
         }
 
         private void CheckSessionRollover(DateTime utcTime)

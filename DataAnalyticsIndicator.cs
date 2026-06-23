@@ -582,17 +582,18 @@ namespace MBO_Market_Data_Analytics
 
         private void DrawMetricValueRow(Graphics g, string label, MetricValue metric, string format, Font fontLabel, Font fontValue, Color colorLabel, Color colorValue, int x, int y, int width, bool isPrice = false, bool isQty = false)
         {
-            using (SolidBrush brushLabel = new SolidBrush(colorLabel))
-                g.DrawString(label, fontLabel, brushLabel, x + 16, y);
-
             string valueStr = FormatMetricValue(metric, format, isPrice, isQty);
-            Color valueColor = colorValue;
+            SizeF valSize = g.MeasureString(valueStr, fontValue);
+            float valueX = x + 250 - valSize.Width;
 
-            using (SolidBrush brushValue = new SolidBrush(valueColor))
-            {
-                SizeF valSize = g.MeasureString(valueStr, fontValue);
-                g.DrawString(valueStr, fontValue, brushValue, x + 250 - valSize.Width, y);
-            }
+            // Clip label so it never overlaps the value
+            float labelMaxWidth = Math.Max(30, valueX - (x + 16) - 4);
+            using (SolidBrush brushLabel = new SolidBrush(colorLabel))
+            using (var sf = new StringFormat { Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap })
+                g.DrawString(label, fontLabel, brushLabel, new RectangleF(x + 16, y, labelMaxWidth, 16), sf);
+
+            using (SolidBrush brushValue = new SolidBrush(colorValue))
+                g.DrawString(valueStr, fontValue, brushValue, valueX, y);
 
             string qualityStr = metric.Quality.ToString().ToUpperInvariant();
             Color qualityColor = GetQualityColor(metric.Quality);
@@ -607,18 +608,21 @@ namespace MBO_Market_Data_Analytics
 
         private void DrawMetricCombinedValueRow(Graphics g, string label, MetricValue metric1, string format1, MetricValue metric2, string format2, Font fontLabel, Font fontValue, Color colorLabel, Color colorValue, int x, int y, int width, bool isPrice = false, bool isQty = false)
         {
-            using (SolidBrush brushLabel = new SolidBrush(colorLabel))
-                g.DrawString(label, fontLabel, brushLabel, x + 16, y);
-
             string valStr1 = FormatMetricValue(metric1, format1, isPrice, isQty);
             string valStr2 = FormatMetricValue(metric2, format2, isPrice, isQty);
             string valueStr = $"{valStr1} / {valStr2}";
 
+            SizeF valSize = g.MeasureString(valueStr, fontValue);
+            float valueX = x + 250 - valSize.Width;
+
+            // Clip label so it never overlaps the value
+            float labelMaxWidth = Math.Max(30, valueX - (x + 16) - 4);
+            using (SolidBrush brushLabel = new SolidBrush(colorLabel))
+            using (var sf = new StringFormat { Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap })
+                g.DrawString(label, fontLabel, brushLabel, new RectangleF(x + 16, y, labelMaxWidth, 16), sf);
+
             using (SolidBrush brushValue = new SolidBrush(colorValue))
-            {
-                SizeF valSize = g.MeasureString(valueStr, fontValue);
-                g.DrawString(valueStr, fontValue, brushValue, x + 250 - valSize.Width, y);
-            }
+                g.DrawString(valueStr, fontValue, brushValue, valueX, y);
 
             MetricQuality minQuality = GetMinQuality(metric1.Quality, metric2.Quality);
             string qualityStr = minQuality.ToString().ToUpperInvariant();

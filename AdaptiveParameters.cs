@@ -13,6 +13,16 @@ namespace MBO_Market_Data_Analytics
     }
 
     /// <summary>
+    /// Whether the controller is currently trading with the flow (momentum) or against it
+    /// (mean-reversion). Determined by the rolling lag-1 autocorrelation of the ratio series.
+    /// </summary>
+    public enum SignalPolarity
+    {
+        Momentum,
+        MeanReversion
+    }
+
+    /// <summary>
     /// Tuning knobs for <see cref="AdaptiveParameterController"/>. Only a few are surfaced as
     /// Quantower inputs; the rest use sensible defaults.
     /// </summary>
@@ -35,6 +45,14 @@ namespace MBO_Market_Data_Analytics
         public double SlAtrMultiplier = 1.0;
         public int MinBracketTicks = 2;
         public int MaxBracketTicks = 200;
+
+        // Phase 2 — polarity (autocorrelation-based regime).
+        // Window of ratio samples used for lag-1 ACF (~15 s at 250 ms intervals).
+        public int AutocorrWindow = 60;
+        // ACF must exceed this to confirm Momentum (hysteresis band avoids rapid flip-flop).
+        public double MomentumAcfThreshold = 0.10;
+        // ACF must fall below this to confirm MeanReversion.
+        public double MeanRevAcfThreshold = -0.10;
     }
 
     /// <summary>
@@ -51,6 +69,8 @@ namespace MBO_Market_Data_Analytics
         public int StopLossTicks { get; init; }
         public double AtrTicks { get; init; }
         public int SampleCount { get; init; }
+        public SignalPolarity Polarity { get; init; }
+        public double Autocorrelation { get; init; }
     }
 
     /// <summary>
@@ -92,6 +112,9 @@ namespace MBO_Market_Data_Analytics
 
         private long lastRecalcTicks;
         private readonly long recalcIntervalTicks;
+
+        // Phase 2: sticky polarity — only changes when ACF crosses a threshold
+        private SignalPolarity currentPolarity = SignalPolarity.Momentum;
 
         private AdaptiveParameters current;
 
@@ -197,13 +220,31 @@ namespace MBO_Market_Data_Analytics
         {
             lastRecalcTicks = nowTicks;
 
+            // Compute lag-1 ACF of recent samples regardless of readiness, so polarity
+            // can be evaluated independently of the percentile thresholds.
+            double acf = 0.0;
+            int acfN = Math.Min(sampleCount, Math.Max(4, cfg.AutocorrWindow));
+            if (acfN >= 4)
+            {
+                var acfBuf = ExtractLastSamples(acfN);
+                acf = Lag1Acf(acfBuf);
+                // Hysteresis: only flip polarity when ACF clearly crosses a threshold.
+                if (acf > cfg.MomentumAcfThreshold)
+                    currentPolarity = SignalPolarity.Momentum;
+                else if (acf < cfg.MeanRevAcfThreshold)
+                    currentPolarity = SignalPolarity.MeanReversion;
+                // else: ACF is ambiguous — hold current polarity
+            }
+
             if (sampleCount < cfg.MinSamples || !atrSeeded)
             {
                 current = new AdaptiveParameters
                 {
                     IsReady = false,
                     SampleCount = sampleCount,
-                    AtrTicks = atrSeeded ? atr / tickSize : 0.0
+                    AtrTicks = atrSeeded ? atr / tickSize : 0.0,
+                    Polarity = currentPolarity,
+                    Autocorrelation = acf
                 };
                 return;
             }
@@ -230,8 +271,58 @@ namespace MBO_Market_Data_Analytics
                 TakeProfitTicks = tp,
                 StopLossTicks = sl,
                 AtrTicks = atrTicks,
-                SampleCount = sampleCount
+                SampleCount = sampleCount,
+                Polarity = currentPolarity,
+                Autocorrelation = acf
             };
+        }
+
+        /// <summary>
+        /// Extracts the most recent <paramref name="n"/> samples from the ring buffer in
+        /// chronological order (oldest first).
+        /// </summary>
+        private double[] ExtractLastSamples(int n)
+        {
+            var buf = new double[n];
+            if (sampleCount < samples.Length)
+            {
+                // Buffer hasn't wrapped: samples stored at [0..sampleCount-1]
+                int start = sampleCount - n;
+                for (int i = 0; i < n; i++) buf[i] = samples[start + i];
+            }
+            else
+            {
+                // Buffer is full and has wrapped: oldest is at sampleHead
+                int start = (sampleHead - n + samples.Length) % samples.Length;
+                for (int i = 0; i < n; i++) buf[i] = samples[(start + i) % samples.Length];
+            }
+            return buf;
+        }
+
+        /// <summary>
+        /// Pearson lag-1 autocorrelation: corr(x[0..n-2], x[1..n-1]).
+        /// Returns 0 if the series is constant or too short.
+        /// </summary>
+        private static double Lag1Acf(double[] x)
+        {
+            int n = x.Length;
+            if (n < 4) return 0.0;
+
+            double mean = 0.0;
+            for (int i = 0; i < n; i++) mean += x[i];
+            mean /= n;
+
+            double cov = 0.0, varSum = 0.0;
+            for (int i = 0; i < n - 1; i++)
+            {
+                double di = x[i] - mean;
+                double di1 = x[i + 1] - mean;
+                cov += di * di1;
+                varSum += di * di;
+            }
+            varSum += (x[n - 1] - mean) * (x[n - 1] - mean);
+
+            return varSum < 1e-12 ? 0.0 : cov / varSum;
         }
 
         private int ClampTicks(int v) => Math.Clamp(v, cfg.MinBracketTicks, cfg.MaxBracketTicks);

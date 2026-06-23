@@ -126,6 +126,8 @@ namespace MBO_Market_Data_Analytics
 
         // Phase 1 adaptive controller (null in Static mode)
         private AdaptiveParameterController? adaptiveController;
+        // Phase 2: last known polarity — used to detect transitions and reset signal state
+        private SignalPolarity lastPolarity = SignalPolarity.Momentum;
 
         // Execution envelope: paper simulator + promotion/demotion state
         private ShadowSimulator? shadowSim;
@@ -499,7 +501,20 @@ namespace MBO_Market_Data_Analytics
                 if (!adaptiveReadyLogged)
                 {
                     adaptiveReadyLogged = true;
-                    Log($"[Adaptive] Controller ready — BuyTh={ap.BuyThreshold:F3} SellTh={ap.SellThreshold:F3} Reset={ap.BuyResetThreshold:F3} ATR={ap.AtrTicks:F1}t TP={ap.TakeProfitTicks} SL={ap.StopLossTicks} ticks ({ap.SampleCount} samples).", StrategyLoggingLevel.Info);
+                    Log($"[Adaptive] Controller ready — BuyTh={ap.BuyThreshold:F3} SellTh={ap.SellThreshold:F3} Reset={ap.BuyResetThreshold:F3} ATR={ap.AtrTicks:F1}t TP={ap.TakeProfitTicks} SL={ap.StopLossTicks} ticks ({ap.SampleCount} samples). Polarity={ap.Polarity}.", StrategyLoggingLevel.Info);
+                }
+
+                // Log polarity transitions and reset signal state so a zombie signal from
+                // the prior regime doesn't fire on the wrong side of the next tick.
+                if (ap.Polarity != lastPolarity)
+                {
+                    Log($"[Polarity] {lastPolarity} → {ap.Polarity} (ACF={ap.Autocorrelation:F3}). Signal state reset.", StrategyLoggingLevel.Info);
+                    lastPolarity = ap.Polarity;
+                    lock (stateLock)
+                    {
+                        buySignalActive = false;
+                        sellSignalActive = false;
+                    }
                 }
 
                 buyTh = ap.BuyThreshold; sellTh = ap.SellThreshold;
@@ -527,7 +542,7 @@ namespace MBO_Market_Data_Analytics
                 lastStatusLogTime = now;
                 var sp = shadowSim?.Performance;
                 string shadowInfo = sp != null ? $"shadow trades={sp.Count} net={sp.NetPnL:C2}" : "";
-                Log($"[Status] ratio={ratio:F3} buyTh={buyTh:F3} sellTh={sellTh:F3} {shadowInfo}", StrategyLoggingLevel.Info);
+                Log($"[Status] ratio={ratio:F3} buyTh={buyTh:F3} sellTh={sellTh:F3} polarity={lastPolarity} {shadowInfo}", StrategyLoggingLevel.Info);
             }
 
             lock (stateLock)
@@ -553,27 +568,53 @@ namespace MBO_Market_Data_Analytics
                 int bestBidOrders = (int)(calc.GetBestBidOrderCount().Value);
                 int bestAskOrders = (int)(calc.GetBestAskOrderCount().Value);
 
-                // Buy signal
-                if (ratio >= buyTh)
+                if (lastPolarity == SignalPolarity.Momentum)
                 {
-                    if (!buySignalActive)
+                    // Buy when buyers dominate, sell when sellers dominate.
+                    if (ratio >= buyTh)
                     {
-                        buySignalActive = true;
-                        EnterSignal(Side.Buy, wantLive, effTp, effSl, bid, ask, now, isWithinCooldown, bestAskOrders);
+                        if (!buySignalActive)
+                        {
+                            buySignalActive = true;
+                            EnterSignal(Side.Buy, wantLive, effTp, effSl, bid, ask, now, isWithinCooldown, bestAskOrders);
+                        }
                     }
-                }
-                else if (ratio <= buyReset) buySignalActive = false;
+                    else if (ratio <= buyReset) buySignalActive = false;
 
-                // Sell signal
-                if (ratio <= sellTh)
-                {
-                    if (!sellSignalActive)
+                    if (ratio <= sellTh)
                     {
-                        sellSignalActive = true;
-                        EnterSignal(Side.Sell, wantLive, effTp, effSl, bid, ask, now, isWithinCooldown, bestBidOrders);
+                        if (!sellSignalActive)
+                        {
+                            sellSignalActive = true;
+                            EnterSignal(Side.Sell, wantLive, effTp, effSl, bid, ask, now, isWithinCooldown, bestBidOrders);
+                        }
                     }
+                    else if (ratio >= sellReset) sellSignalActive = false;
                 }
-                else if (ratio >= sellReset) sellSignalActive = false;
+                else
+                {
+                    // Mean-reversion: buy when sellers dominate (expect bounce), sell when buyers dominate (expect fade).
+                    // Reset when flow returns to neutral (median). buyReset/sellReset are both median, so direction is symmetric.
+                    if (ratio <= sellTh)
+                    {
+                        if (!buySignalActive)
+                        {
+                            buySignalActive = true;
+                            EnterSignal(Side.Buy, wantLive, effTp, effSl, bid, ask, now, isWithinCooldown, bestAskOrders);
+                        }
+                    }
+                    else if (ratio >= buyReset) buySignalActive = false;
+
+                    if (ratio >= buyTh)
+                    {
+                        if (!sellSignalActive)
+                        {
+                            sellSignalActive = true;
+                            EnterSignal(Side.Sell, wantLive, effTp, effSl, bid, ask, now, isWithinCooldown, bestBidOrders);
+                        }
+                    }
+                    else if (ratio <= sellReset) sellSignalActive = false;
+                }
             }
         }
 

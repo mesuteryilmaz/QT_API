@@ -188,6 +188,9 @@ namespace MBO_Market_Data_Analytics
         public MetricValue Delta30s { get; init; }
         public MetricValue Delta60s { get; init; }
         public MetricValue DeltaVelocity { get; init; }
+
+        // Order Flow Imbalance
+        public MetricValue Ofi { get; init; }
     }
 
     /// <summary>

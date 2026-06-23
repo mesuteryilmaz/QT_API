@@ -1024,9 +1024,12 @@ namespace MBO_Market_Data_Analytics
                 var newStatus = ord.Status;
                 var oldFilled = state.FilledQuantity;
                 var newFilled = ord.FilledQuantity;
+                double oldCumAvg = state.CumAverageFillPrice;
+                double newCumAvg = ord.AverageFillPrice > 0 ? ord.AverageFillPrice : state.Price;
 
                 state.Status = newStatus;
                 state.FilledQuantity = newFilled;
+                state.CumAverageFillPrice = newCumAvg;
 
                 if (newFilled > oldFilled)
                 {
@@ -1050,14 +1053,20 @@ namespace MBO_Market_Data_Analytics
 
                     if (!rejectFill)
                     {
-                        ProcessExecutionFill(ord.Side, ord.AverageFillPrice > 0 ? ord.AverageFillPrice : ord.Price, filledDiff);
+                        // M-12: AverageFillPrice is cumulative; derive the marginal price for this increment
+                        double marginalPrice = (oldFilled <= 0 || oldCumAvg <= 0)
+                            ? newCumAvg
+                            : (newFilled * newCumAvg - oldFilled * oldCumAvg) / filledDiff;
+                        if (marginalPrice <= 0) marginalPrice = state.Price;
+
+                        ProcessExecutionFill(ord.Side, marginalPrice, filledDiff);
 
                         // Only our own signal entries spawn protective brackets. Bracket fills and
                         // reconciled (post-reconnect, role-unknown) orders must NOT spawn new brackets,
                         // otherwise a TP/SL fill after a reconnect would cascade into fresh orders.
                         if (state.Role == OrderRole.Entry)
                         {
-                            ManageBracketsForFill(ord.Side, ord.AverageFillPrice > 0 ? ord.AverageFillPrice : ord.Price, filledDiff);
+                            ManageBracketsForFill(ord.Side, marginalPrice, filledDiff);
                         }
                     }
                 }
@@ -1484,6 +1493,7 @@ namespace MBO_Market_Data_Analytics
         public double Price { get; init; }
         public double Quantity { get; init; }
         public double FilledQuantity { get; set; }
+        public double CumAverageFillPrice { get; set; } // M-12: tracks cumulative avg to derive marginal fill price
         public OrderStatus Status { get; set; }
         public Order? OrderInstance { get; set; }
         public OrderRole Role { get; init; }

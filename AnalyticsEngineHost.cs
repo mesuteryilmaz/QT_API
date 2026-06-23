@@ -722,7 +722,9 @@ namespace MBO_Market_Data_Analytics
                 Delta5s = calc.GetDelta5s(),
                 Delta30s = calc.GetDelta30s(),
                 Delta60s = calc.GetDelta60s(),
-                DeltaVelocity = calc.GetDeltaVelocity()
+                DeltaVelocity = calc.GetDeltaVelocity(),
+
+                Ofi = calc.GetOfi()
             };
 
             if (config.EnableFeatureStore && !string.IsNullOrEmpty(config.FeatureStorePath))

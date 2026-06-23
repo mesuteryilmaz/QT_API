@@ -113,7 +113,9 @@ namespace MBO_Market_Data_Analytics
         // Saturation value returned for ratios whose denominator is zero but numerator is positive
         // (e.g. strong one-sided buying with zero sell volume). Prevents a degenerate "0" from being
         // misread as the opposite extreme by downstream signal logic.
-        private const double RATIO_SATURATION = 999.0;
+        // M-21: must equal AdaptiveParameterConfig.RatioClampMax (10.0) so saturated ratios are
+        // clamped to the same ceiling used by adaptive history samples.
+        private const double RATIO_SATURATION = 10.0;
 
         // Latest event time the engine has advanced to (event-time clock).
         private long currentTicks;
@@ -644,6 +646,13 @@ namespace MBO_Market_Data_Analytics
                 l2Agg.Clear();
                 recentAdditions.Clear();
                 recentExecutions.Clear();
+                // M-04: pattern queues are derived from book state; stale entries produce ghost signals after reconnect
+                icebergEvents.Clear();
+                replenishmentEvents.Clear();
+                spoofEvents.Clear();
+                _icebergBidSum = _icebergAskSum = 0;
+                _replenishBidSum = _replenishAskSum = 0;
+                _spoofBidSum = _spoofAskSum = 0;
             }
         }
 
@@ -1104,6 +1113,11 @@ namespace MBO_Market_Data_Analytics
             double d2 = tradeAgg.Delta(TradeWindows.S2);
             return CreateMetric((2.0 * d1) - d2, GetTradeQuality(), IsTradeWarm(2));
         }
+
+        // --- 6. Order Flow Imbalance ---
+
+        public MetricValue GetOfi()
+            => CreateMetric(ofiSum, IsL2Warm() ? MetricQuality.Derived : MetricQuality.Unavailable, IsCalibrated);
 
         // --- 6. VWAP Analytics ---
 

@@ -106,6 +106,14 @@ namespace MBO_Market_Data_Analytics
             if (closed || size <= 0)
             {
                 action = MboAction.Remove;
+                // M-01: feed Remove callbacks may carry empty/zero fields; emit the stored order's values
+                if (orders.TryGetValue(key, out var stored))
+                {
+                    isBid = stored.IsBid;
+                    price = stored.PriceTicks * tickSize;
+                    size = stored.Size;
+                    priority = stored.Priority;
+                }
                 RemoveOrder(key);
             }
             else if (orders.ContainsKey(key))

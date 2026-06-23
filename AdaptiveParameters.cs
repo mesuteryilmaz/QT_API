@@ -196,7 +196,7 @@ namespace MBO_Market_Data_Analytics
                     lastSampleTicks = now;
                 }
                 if (ratioUsable)
-                    lastObservedRatio = ratio;
+                    lastObservedRatio = Math.Clamp(ratio, 0.0, cfg.RatioClampMax); // M-21: unclipped ratio skewed extreme-regime thresholds
 
                 if (now - lastRecalcTicks >= recalcIntervalTicks)
                     Recalc(now);

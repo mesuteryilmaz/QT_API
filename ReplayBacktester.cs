@@ -147,6 +147,24 @@ namespace MBO_Market_Data_Analytics
                 return result;
             }
 
+            // H-22: guarantee chronological order; feed replay buffers are not always sorted
+            int outOfOrder = 0;
+            for (int i = 1; i < trades.Count; i++)
+                if (trades[i].Time < trades[i - 1].Time) outOfOrder++;
+
+            IReadOnlyList<BacktestTrade> orderedTrades;
+            if (outOfOrder > 0)
+            {
+                var sorted = new List<BacktestTrade>(trades);
+                sorted.Sort((a, b) => a.Time.CompareTo(b.Time));
+                orderedTrades = sorted;
+                result.Message = $"{outOfOrder} out-of-order feed event(s) detected and re-sorted before replay.";
+            }
+            else
+            {
+                orderedTrades = trades;
+            }
+
             var calc = new DataAnalyticsCalculator(symbol, FeedCapabilities.Trades | FeedCapabilities.TradeAggressor)
             {
                 TradeVolumeWindowShort = cfg.TradeVolumeWindowShort,
@@ -175,8 +193,8 @@ namespace MBO_Market_Data_Analytics
             double grossProfitNet = 0, grossLossNet = 0;
             long withAgg = 0;
 
-            result.FirstEvent = trades[0].Time;
-            result.LastEvent = trades[trades.Count - 1].Time;
+            result.FirstEvent = orderedTrades[0].Time;
+            result.LastEvent = orderedTrades[orderedTrades.Count - 1].Time;
 
             double prevPrice = double.NaN;
 
@@ -233,7 +251,7 @@ namespace MBO_Market_Data_Analytics
                 }
             }
 
-            foreach (var raw in trades)
+            foreach (var raw in orderedTrades)
             {
                 // Aggressor resolution (use feed flag, else tick rule)
                 AggressorFlag agg = raw.Aggressor;
@@ -310,7 +328,7 @@ namespace MBO_Market_Data_Analytics
             // Close any residual open position at the last price
             if (pos != 0)
             {
-                var last = trades[trades.Count - 1];
+                var last = orderedTrades[orderedTrades.Count - 1];
                 Close(last.Price, last.Time, BacktestExitReason.EndOfData);
             }
 

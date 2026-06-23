@@ -198,6 +198,8 @@ Key inputs (full tables in [`DataAnalytics.md`](DataAnalytics.md#configuration-r
 
 ## Documentation
 
+- [`OVERVIEW.md`](OVERVIEW.md) — project philosophy, full signal-chain diagram,
+  adaptive stack diagram (Phases 1–3), shadow→live gate, and key design decisions.
 - [`DataAnalytics.md`](DataAnalytics.md) — full metric specification, implemented
   architecture, calibration, HUD layout, and configuration reference.
 - [`CLAUDE.md`](CLAUDE.md) — project constraints and engineering conventions for

@@ -23,6 +23,16 @@ namespace MBO_Market_Data_Analytics
     }
 
     /// <summary>
+    /// Phase 3 regime gate. StandAside means the controller has detected a pathological condition
+    /// (volatility spike or extreme ratio) and the strategy should not enter new positions.
+    /// </summary>
+    public enum RegimeState
+    {
+        Normal,
+        StandAside
+    }
+
+    /// <summary>
     /// Tuning knobs for <see cref="AdaptiveParameterController"/>. Only a few are surfaced as
     /// Quantower inputs; the rest use sensible defaults.
     /// </summary>
@@ -53,6 +63,17 @@ namespace MBO_Market_Data_Analytics
         public double MomentumAcfThreshold = 0.10;
         // ACF must fall below this to confirm MeanReversion.
         public double MeanRevAcfThreshold = -0.10;
+
+        // Phase 3 — regime classifier (stand-aside gate).
+        // Fast ATR period for volatility spike detection (minutes, Wilder smoothing).
+        public int FastAtrPeriod = 5;
+        // fastAtr / baselineAtr above this ratio triggers a volatility stand-aside.
+        // Surfaced as a strategy input so the operator can tune it.
+        public double VolatilityGateRatio = 1.5;
+        // Ratio percentile above/below which the reading is considered pathologically extreme.
+        // Normal signals fire at EntryUpperPercentile (0.85); extreme is well above that.
+        public double ExtremeUpperPercentile = 0.97;
+        public double ExtremeLowerPercentile = 0.03;
     }
 
     /// <summary>
@@ -71,6 +92,8 @@ namespace MBO_Market_Data_Analytics
         public int SampleCount { get; init; }
         public SignalPolarity Polarity { get; init; }
         public double Autocorrelation { get; init; }
+        public RegimeState Regime { get; init; }
+        public double VolatilityRatio { get; init; }   // fastAtr / baselineAtr; diagnostic
     }
 
     /// <summary>
@@ -105,7 +128,9 @@ namespace MBO_Market_Data_Analytics
 
         // ATR (price units) via live 1-minute bars
         private bool atrSeeded;
-        private double atr;
+        private double atr;        // baseline ATR (cfg.AtrPeriod, slow — tracks multi-hour vol)
+        private bool fastAtrSeeded;
+        private double fastAtr;    // fast ATR (cfg.FastAtrPeriod — tracks recent vol spike)
         private long curMinuteTicks = long.MinValue;
         private double curHigh, curLow, curClose;
         private double prevClose = double.NaN;
@@ -115,6 +140,9 @@ namespace MBO_Market_Data_Analytics
 
         // Phase 2: sticky polarity — only changes when ACF crosses a threshold
         private SignalPolarity currentPolarity = SignalPolarity.Momentum;
+
+        // Phase 3: last ratio observed (cached for regime check in Recalc)
+        private double lastObservedRatio;
 
         private AdaptiveParameters current;
 
@@ -128,7 +156,7 @@ namespace MBO_Market_Data_Analytics
             this.current = new AdaptiveParameters { IsReady = false };
         }
 
-        /// <summary>Seeds the ATR from historical bars before live data arrives.</summary>
+        /// <summary>Seeds both ATRs from historical bars before live data arrives.</summary>
         public void SeedAtr(double atrPrice, double lastClose)
         {
             lock (sync)
@@ -137,6 +165,8 @@ namespace MBO_Market_Data_Analytics
                 {
                     atr = atrPrice;
                     atrSeeded = true;
+                    fastAtr = atrPrice;   // seed both to the same value; fastAtr diverges as live bars arrive
+                    fastAtrSeeded = true;
                 }
                 if (lastClose > 0)
                     prevClose = lastClose;
@@ -165,6 +195,8 @@ namespace MBO_Market_Data_Analytics
                     AddSample(Math.Clamp(ratio, 0.0, cfg.RatioClampMax));
                     lastSampleTicks = now;
                 }
+                if (ratioUsable)
+                    lastObservedRatio = ratio;
 
                 if (now - lastRecalcTicks >= recalcIntervalTicks)
                     Recalc(now);
@@ -211,6 +243,14 @@ namespace MBO_Market_Data_Analytics
                 atrSeeded = true;
             }
 
+            if (fastAtrSeeded)
+                fastAtr += (tr - fastAtr) / Math.Max(1, cfg.FastAtrPeriod);
+            else
+            {
+                fastAtr = tr;
+                fastAtrSeeded = true;
+            }
+
             prevClose = curClose;
             curMinuteTicks = minute;
             curHigh = curLow = curClose = price;
@@ -236,6 +276,9 @@ namespace MBO_Market_Data_Analytics
                 // else: ACF is ambiguous — hold current polarity
             }
 
+            // Compute volatility ratio regardless of readiness so the gate can fire early.
+            double voltRatio = (atrSeeded && fastAtrSeeded && atr > 0) ? fastAtr / atr : 1.0;
+
             if (sampleCount < cfg.MinSamples || !atrSeeded)
             {
                 current = new AdaptiveParameters
@@ -244,7 +287,9 @@ namespace MBO_Market_Data_Analytics
                     SampleCount = sampleCount,
                     AtrTicks = atrSeeded ? atr / tickSize : 0.0,
                     Polarity = currentPolarity,
-                    Autocorrelation = acf
+                    Autocorrelation = acf,
+                    Regime = RegimeState.Normal,   // don't gate during warmup — IsReady=false already blocks entry
+                    VolatilityRatio = voltRatio
                 };
                 return;
             }
@@ -256,6 +301,16 @@ namespace MBO_Market_Data_Analytics
             double buyTh = Percentile(arr, cfg.EntryUpperPercentile);
             double sellTh = Percentile(arr, cfg.EntryLowerPercentile);
             double median = Percentile(arr, 0.5);
+
+            // Gate 1: volatility spike — current short-window ATR well above baseline.
+            bool voltSpike = voltRatio > cfg.VolatilityGateRatio;
+
+            // Gate 2: extreme ratio — current ratio in the pathological tail beyond entry thresholds.
+            double extremeBuyTh = Percentile(arr, cfg.ExtremeUpperPercentile);
+            double extremeSellTh = Percentile(arr, cfg.ExtremeLowerPercentile);
+            bool extremeRatio = lastObservedRatio > extremeBuyTh || lastObservedRatio < extremeSellTh;
+
+            RegimeState regime = (voltSpike || extremeRatio) ? RegimeState.StandAside : RegimeState.Normal;
 
             double atrTicks = atr / tickSize;
             int tp = ClampTicks((int)Math.Round(atrTicks * cfg.TpAtrMultiplier));
@@ -273,7 +328,9 @@ namespace MBO_Market_Data_Analytics
                 AtrTicks = atrTicks,
                 SampleCount = sampleCount,
                 Polarity = currentPolarity,
-                Autocorrelation = acf
+                Autocorrelation = acf,
+                Regime = regime,
+                VolatilityRatio = voltRatio
             };
         }
 

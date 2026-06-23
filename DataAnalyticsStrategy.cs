@@ -122,12 +122,21 @@ namespace MBO_Market_Data_Analytics
         [InputParameter("Demotion Min Trades", 31, minimum: 5, maximum: 10000, increment: 5, decimalPlaces: 0)]
         public int InputDemotionMinTrades = 20;
 
+        // Phase 3 — regime classifier gates
+        [InputParameter("Volatility Gate Ratio (fastATR/ATR)", 32, minimum: 1.0, maximum: 5.0, increment: 0.1, decimalPlaces: 1)]
+        public double InputVolatilityGateRatio = 1.5;
+
+        [InputParameter("Thin Queue Stand-Aside (MBO orders, 0=off)", 33, minimum: 0, maximum: 20, increment: 1, decimalPlaces: 0)]
+        public int InputThinQueueThreshold = 2;
+
         private AnalyticsEngineHost? engine;
 
         // Phase 1 adaptive controller (null in Static mode)
         private AdaptiveParameterController? adaptiveController;
         // Phase 2: last known polarity — used to detect transitions and reset signal state
         private SignalPolarity lastPolarity = SignalPolarity.Momentum;
+        // Phase 3: last known regime — used to log stand-aside transitions
+        private RegimeState lastRegime = RegimeState.Normal;
 
         // Execution envelope: paper simulator + promotion/demotion state
         private ShadowSimulator? shadowSim;
@@ -250,7 +259,8 @@ namespace MBO_Market_Data_Analytics
                     EntryLowerPercentile = 1.0 - upper,
                     AtrPeriod = InputAtrPeriod,
                     TpAtrMultiplier = InputTpAtrMultiplier,
-                    SlAtrMultiplier = InputSlAtrMultiplier
+                    SlAtrMultiplier = InputSlAtrMultiplier,
+                    VolatilityGateRatio = Math.Max(1.0, InputVolatilityGateRatio)
                 }, this.CurrentSymbol.TickSize);
 
                 SeedAdaptiveAtrFromHistory();
@@ -565,8 +575,38 @@ namespace MBO_Market_Data_Analytics
 
                 bool isWithinCooldown = (now - lastOrderPlacementTime) < TimeSpan.FromSeconds(InputCooldownSeconds);
 
-                int bestBidOrders = (int)(calc.GetBestBidOrderCount().Value);
-                int bestAskOrders = (int)(calc.GetBestAskOrderCount().Value);
+                // Phase 3: regime gate — stand aside on volatility spike, extreme ratio, or thin queue.
+                var bidOC = calc.GetBestBidOrderCount();
+                var askOC = calc.GetBestAskOrderCount();
+                bool orderCountExact = bidOC.Quality == MetricQuality.Exact;
+                int totalBestOrders = (int)(bidOC.Value + askOC.Value);
+                int bestBidOrders = (int)bidOC.Value;
+                int bestAskOrders = (int)askOC.Value;
+
+                // Controller gates: volatility spike + extreme ratio
+                RegimeState currentRegime = (InputParameterMode == StrategyParameterMode.Adaptive && adaptiveController != null)
+                    ? adaptiveController.Current.Regime
+                    : RegimeState.Normal;
+
+                // Thin-queue gate (MBO only, disabled when InputThinQueueThreshold == 0)
+                bool thinQueue = orderCountExact && InputThinQueueThreshold > 0
+                    && totalBestOrders <= InputThinQueueThreshold;
+                if (thinQueue) currentRegime = RegimeState.StandAside;
+
+                // Log regime transitions
+                if (currentRegime != lastRegime)
+                {
+                    var ap2 = (InputParameterMode == StrategyParameterMode.Adaptive && adaptiveController != null)
+                        ? adaptiveController.Current : null;
+                    string reason = thinQueue
+                        ? $"thin queue ({totalBestOrders} orders at best)"
+                        : $"voltRatio={ap2?.VolatilityRatio:F2} extremeRatio or spike";
+                    Log($"[Regime] {lastRegime} → {currentRegime}: {reason}", StrategyLoggingLevel.Info);
+                    lastRegime = currentRegime;
+                }
+
+                if (currentRegime == RegimeState.StandAside)
+                    return;
 
                 if (lastPolarity == SignalPolarity.Momentum)
                 {

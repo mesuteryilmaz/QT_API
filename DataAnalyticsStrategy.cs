@@ -667,7 +667,15 @@ namespace MBO_Market_Data_Analytics
                 if (isRiskHalted || !isConnectionActive || isOrderPlacementPending || isWithinCooldown)
                     return;
 
-                bool exposureOk = side == Side.Buy ? currentPositionSize < MaxExposure : currentPositionSize > -MaxExposure;
+                // Worst-case exposure = confirmed position + unfilled working entries (same side) + proposed order.
+                // Checking only currentPositionSize would allow over-exposure when entry orders are pending.
+                double pendingSameSide = trackedOrders.Values
+                    .Where(o => o.Side == side && o.Role == OrderRole.Entry &&
+                                (o.Status == OrderStatus.Opened || o.Status == OrderStatus.PartiallyFilled))
+                    .Sum(o => o.Quantity - o.FilledQuantity);
+                bool exposureOk = side == Side.Buy
+                    ? currentPositionSize + pendingSameSide + OrderQty <= MaxExposure
+                    : -currentPositionSize + pendingSameSide + OrderQty <= MaxExposure;
                 if (!exposureOk) return;
 
                 bool hasPending = trackedOrders.Values.Any(o => o.Side == side && o.Role != OrderRole.Bracket &&

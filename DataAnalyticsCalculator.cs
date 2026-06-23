@@ -746,49 +746,59 @@ namespace MBO_Market_Data_Analytics
 
         private GridMakerResult ScanForGridMaker()
         {
-            long bestSize = 0;
-            int bestCount = 0;
-            foreach (var kvp in ordersBySizeBucket)
-            {
-                if (kvp.Value.Count > bestCount) { bestCount = kvp.Value.Count; bestSize = kvp.Key; }
-            }
-            if (bestCount < 4) return default;
+            GridMakerResult best = default;
 
             var bidTicks = new List<long>();
             var askTicks = new List<long>();
-            foreach (var id in ordersBySizeBucket[bestSize])
+
+            foreach (var kvp in ordersBySizeBucket)
             {
-                if (mboOrders.TryGetValue(id, out var o))
+                // Skip buckets too small to form a grid, or so large they are clearly
+                // just all-market 1-lot noise (no real grid has 50+ levels per side).
+                int count = kvp.Value.Count;
+                if (count < 4 || count > 60) continue;
+
+                bidTicks.Clear();
+                askTicks.Clear();
+                foreach (var id in kvp.Value)
                 {
-                    if (o.IsBid) bidTicks.Add(o.Ticks);
-                    else askTicks.Add(o.Ticks);
+                    if (mboOrders.TryGetValue(id, out var o))
+                    {
+                        if (o.IsBid) bidTicks.Add(o.Ticks);
+                        else askTicks.Add(o.Ticks);
+                    }
+                }
+                if (bidTicks.Count < 2 || askTicks.Count < 2) continue;
+
+                bidTicks.Sort();
+                askTicks.Sort();
+
+                double bidReg = MeasureGridSpacing(bidTicks, out int bidSpacing);
+                double askReg = MeasureGridSpacing(askTicks, out int askSpacing);
+
+                if (Math.Abs(bidSpacing - askSpacing) > 2) continue;
+                int spacing = (bidSpacing + askSpacing) / 2;
+                if (spacing < 1) continue;
+
+                double symmetry = (double)Math.Min(bidTicks.Count, askTicks.Count) / Math.Max(bidTicks.Count, askTicks.Count);
+                double levelBonus = Math.Min(1.0, Math.Min(bidTicks.Count, askTicks.Count) / 5.0);
+                double score = bidReg * askReg * Math.Sqrt(symmetry) * levelBonus;
+
+                if (score > best.Score)
+                {
+                    best = new GridMakerResult
+                    {
+                        OrderSize = kvp.Key,
+                        BidLevels = bidTicks.Count,
+                        AskLevels = askTicks.Count,
+                        SpacingTicks = spacing,
+                        Symmetry = symmetry,
+                        Score = score
+                    };
                 }
             }
-            if (bidTicks.Count < 2 || askTicks.Count < 2) return default;
 
-            bidTicks.Sort();
-            askTicks.Sort();
-
-            double bidReg = MeasureGridSpacing(bidTicks, out int bidSpacing);
-            double askReg = MeasureGridSpacing(askTicks, out int askSpacing);
-
-            if (Math.Abs(bidSpacing - askSpacing) > 1) return default;
-            int spacing = (bidSpacing + askSpacing) / 2;
-            if (spacing < 1) return default;
-
-            double symmetry = (double)Math.Min(bidTicks.Count, askTicks.Count) / Math.Max(bidTicks.Count, askTicks.Count);
-            double levelBonus = Math.Min(1.0, Math.Min(bidTicks.Count, askTicks.Count) / 5.0);
-            double score = bidReg * askReg * Math.Sqrt(symmetry) * levelBonus;
-
-            return new GridMakerResult
-            {
-                OrderSize = bestSize,
-                BidLevels = bidTicks.Count,
-                AskLevels = askTicks.Count,
-                SpacingTicks = spacing,
-                Symmetry = symmetry,
-                Score = score
-            };
+            return best;
         }
 
         private static double MeasureGridSpacing(List<long> sortedTicks, out int medianSpacing)

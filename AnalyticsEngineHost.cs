@@ -274,9 +274,11 @@ namespace MBO_Market_Data_Analytics
 
                     if (snap == null)
                     {
-                        log("MBO snapshot returned null — downgrading to MBP mode for this session.", LoggingLevel.System);
-                        Calculator.MboMode = false;
-                        // fall through to MBP path below
+                        // Null snapshot can occur on mapped symbols where GetDepthOfMarketAggregatedCollections
+                        // routes to the execution connection. Live events from the mapped data connection
+                        // may still carry real order IDs. Defer the MBO/MBP decision to the live coverage check.
+                        log("MBO snapshot returned null (execution connection may not support GetMBOItems). Seeding book from MBP snapshot; live coverage check will confirm MBO.", LoggingLevel.System);
+                        // fall through to MBP seed path below (MboMode stays true)
                     }
                     else
                     {
@@ -301,14 +303,17 @@ namespace MBO_Market_Data_Analytics
                                     ac++;
                                 }
 
-                        // C-04: if the snapshot contained items but none had real order IDs,
-                        // the feed is delivering MBP-aggregated data labelled as MBO. Downgrade.
                         if (totalItems > 0 && bc + ac == 0)
                         {
-                            log("MBO snapshot contained no real order IDs — feed appears MBP-aggregated. Downgrading to MBP mode.", LoggingLevel.System);
-                            Calculator.MboMode = false;
-                            mboBook = null;
-                            // fall through to MBP path below
+                            // Snapshot items have null IDs. This happens when the symbol is mapped
+                            // (e.g. MNQU6/IB execution → dxFeed data): GetDepthOfMarketAggregatedCollections
+                            // routes to the execution connection (IB, MBP-only) rather than the mapped
+                            // data connection (dxFeed, MBO-capable). Live NewLevel2 events DO carry
+                            // real Level2Quote.Id values from dxFeed. Don't downgrade here — seed the
+                            // book from the MBP snapshot for initial display and let the 100-event live
+                            // coverage check be the sole arbiter of MBO capability.
+                            log("MBO snapshot had no order IDs (execution connection is MBP-only). Seeding book from MBP snapshot; live coverage check will confirm MBO.", LoggingLevel.System);
+                            // fall through to MBP seed path below (MboMode stays true)
                         }
                         else
                         {
@@ -525,10 +530,11 @@ namespace MBO_Market_Data_Analytics
 
                     if (snap == null)
                     {
-                        log("MBO recovery snapshot returned null — downgrading to MBP mode.", LoggingLevel.System);
-                        Calculator.MboMode = false;
-                        mboBook = null;
-                        // fall through to MBP path below
+                        // Same mapped-symbol case as SeedBookSnapshot: snapshot routes to the execution
+                        // connection (IB) which doesn't support GetMBOItems. MBO was confirmed by live
+                        // coverage — keep MboMode and rebuild from MBP snapshot for now.
+                        log("MBO recovery snapshot returned null (execution connection). Rebuilding book from MBP snapshot; MBO mode retained.", LoggingLevel.System);
+                        // fall through to MBP path below (MboMode stays true)
                     }
                     else
                     {

@@ -191,6 +191,13 @@ namespace MBO_Market_Data_Analytics
 
         // Order Flow Imbalance
         public MetricValue Ofi { get; init; }
+
+        // Grid Market Maker Detector
+        public MetricValue GridMakerScore { get; init; }
+        public MetricValue GridMakerBidLevels { get; init; }
+        public MetricValue GridMakerAskLevels { get; init; }
+        public MetricValue GridMakerSpacingTicks { get; init; }
+        public MetricValue GridMakerOrderSize { get; init; }
     }
 
     /// <summary>
@@ -301,7 +308,7 @@ namespace MBO_Market_Data_Analytics
             int x = 20;
             int y = 50;
             int width = 740;
-            int height = 540;
+            int height = 560;
             int rowHeight = 19;
 
             // Draw Background panel
@@ -407,6 +414,27 @@ namespace MBO_Market_Data_Analytics
                 drawY1 += rowHeight;
 
                 DrawMetricValueRow(g, "Delta Velocity (1s Diff)", snapshot.DeltaVelocity, "F0", fontLabel, fontValue, textSecondary, textPrimary, col1X, drawY1, colWidth);
+                drawY1 += rowHeight;
+
+                DrawMetricValueRow(g, "Order Flow Imbalance (OFI)", snapshot.Ofi, "F0", fontLabel, fontValue, textSecondary, textPrimary, col1X, drawY1, colWidth);
+
+                drawY1 += rowHeight;
+                drawY1 += 7; // Separator
+
+                // Category 7: Grid Market Maker Detector
+                DrawCategoryHeader(g, "7. GRID MAKER DETECTOR", fontCategory, col1X, drawY1, colWidth);
+                drawY1 += 17;
+
+                DrawMetricValueRow(g, "Grid Confidence Score", snapshot.GridMakerScore, "P0", fontLabel, fontValue, textSecondary, accentOrange, col1X, drawY1, colWidth);
+                drawY1 += rowHeight;
+
+                DrawMetricCombinedValueRow(g, "Grid Bid / Ask Levels", snapshot.GridMakerBidLevels, "F0", snapshot.GridMakerAskLevels, "F0", fontLabel, fontValue, textSecondary, textPrimary, col1X, drawY1, colWidth);
+                drawY1 += rowHeight;
+
+                DrawMetricValueRow(g, "Grid Spacing (Ticks)", snapshot.GridMakerSpacingTicks, "F0", fontLabel, fontValue, textSecondary, textPrimary, col1X, drawY1, colWidth);
+                drawY1 += rowHeight;
+
+                DrawMetricValueRow(g, "Grid Order Size", snapshot.GridMakerOrderSize, "F0", fontLabel, fontValue, textSecondary, textPrimary, col1X, drawY1, colWidth);
 
                 // ==========================================
                 // COLUMN 2: DOM, ARRIVALS & MICROSTRUCTURE
@@ -481,7 +509,7 @@ namespace MBO_Market_Data_Analytics
                 // ==========================================
                 // Draw horizontal line separator
                 using (Pen pen = new Pen(borderClr, 1.5f))
-                    g.DrawLine(pen, x, y + 440, x + width, y + 440);
+                    g.DrawLine(pen, x, y + 480, x + width, y + 480);
 
                 // Status indicators
                 string statusText;
@@ -519,7 +547,7 @@ namespace MBO_Market_Data_Analytics
                 string dataMode = snapshot.IsMboActive ? "MBO (per-order)" : "MBP (price-level)";
                 Color dataModeColor = snapshot.IsMboActive ? accentGreen : accentOrange;
 
-                int bottomY = y + 448;
+                int bottomY = y + 488;
                 using (SolidBrush textBrush = new SolidBrush(textSecondary))
                 {
                     g.DrawString("Engine Status:", fontMini, textBrush, x + 16, bottomY);

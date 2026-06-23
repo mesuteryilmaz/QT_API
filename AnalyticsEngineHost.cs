@@ -764,7 +764,13 @@ namespace MBO_Market_Data_Analytics
                 Delta60s = calc.GetDelta60s(),
                 DeltaVelocity = calc.GetDeltaVelocity(),
 
-                Ofi = calc.GetOfi()
+                Ofi = calc.GetOfi(),
+
+                GridMakerScore = calc.GetGridMakerScore(),
+                GridMakerBidLevels = calc.GetGridMakerBidLevels(),
+                GridMakerAskLevels = calc.GetGridMakerAskLevels(),
+                GridMakerSpacingTicks = calc.GetGridMakerSpacingTicks(),
+                GridMakerOrderSize = calc.GetGridMakerOrderSize()
             };
 
             if (config.EnableFeatureStore && !string.IsNullOrEmpty(config.FeatureStorePath))

@@ -203,6 +203,20 @@ namespace MBO_Market_Data_Analytics
         // the order was added. Enables exact add→cancel matching without a price+time heuristic.
         private readonly Dictionary<string, L2AdditionTracker> mboAddByOrderId = new Dictionary<string, L2AdditionTracker>();
 
+        // Grid market maker detection (MBO mode only).
+        private struct GridMakerResult
+        {
+            public long OrderSize;
+            public int BidLevels;
+            public int AskLevels;
+            public int SpacingTicks;
+            public double Symmetry;
+            public double Score;
+        }
+        private readonly Dictionary<long, HashSet<string>> ordersBySizeBucket = new();
+        private GridMakerResult gridMaker;
+        private int mboScanCountdown = 0;
+
         // Per-price order counts (MBO mode only). Maintained in parallel with bidBook/askBook so that
         // the number of distinct orders at the best bid/ask can be read in O(1).
         private readonly Dictionary<long, int> bidCountBook = new Dictionary<long, int>();
@@ -453,11 +467,13 @@ namespace MBO_Market_Data_Analytics
                             double purged = ApplyPriceLevelDelta(dup.IsBid, dup.Ticks, -dup.Size);
                             UpdateBest(dup.IsBid, dup.Ticks, purged);
                             CountBookDec(dup.IsBid, dup.Ticks);
+                            GridIndexRemove(orderId, dup.Size);
                         }
                         double nt = ApplyPriceLevelDelta(isBid, tick, evt.Size);
                         mboOrders[orderId] = new MboLevelRef { Ticks = tick, Size = evt.Size, IsBid = isBid };
                         UpdateBest(isBid, tick, nt);
                         CountBookInc(isBid, tick);
+                        GridIndexAdd(orderId, evt.Size);
                         if (!isDuplicate) RecordL2Addition(evt.Time, evt.Price, evt.Size, isBid, orderId);
                         break;
                     }
@@ -471,7 +487,9 @@ namespace MBO_Market_Data_Analytics
                                 if (delta != 0)
                                 {
                                     double nt = ApplyPriceLevelDelta(isBid, tick, delta);
+                                    GridIndexRemove(orderId, existing.Size);
                                     existing.Size = evt.Size;
+                                    GridIndexAdd(orderId, existing.Size);
                                     UpdateBest(isBid, tick, nt);
                                     if (delta > 0) RecordL2Addition(evt.Time, evt.Price, delta, isBid, orderId);
                                     else HandleL2Reduction(evt.Time, evt.Price, -delta, isBid, orderId);
@@ -485,10 +503,12 @@ namespace MBO_Market_Data_Analytics
                                 double oldTotal = ApplyPriceLevelDelta(existing.IsBid, existing.Ticks, -existing.Size);
                                 UpdateBest(existing.IsBid, existing.Ticks, oldTotal);
                                 CountBookDec(existing.IsBid, existing.Ticks);
+                                GridIndexRemove(orderId, existing.Size);
                                 double newTotal = ApplyPriceLevelDelta(isBid, tick, evt.Size);
                                 existing.Ticks = tick; existing.Size = evt.Size; existing.IsBid = isBid;
                                 UpdateBest(isBid, tick, newTotal);
                                 CountBookInc(isBid, tick);
+                                GridIndexAdd(orderId, evt.Size);
                                 totalRepriceCount++;
                                 totalRepriceQty += evt.Size;
                             }
@@ -500,6 +520,7 @@ namespace MBO_Market_Data_Analytics
                             mboOrders[orderId] = new MboLevelRef { Ticks = tick, Size = evt.Size, IsBid = isBid };
                             UpdateBest(isBid, tick, nt);
                             CountBookInc(isBid, tick);
+                            GridIndexAdd(orderId, evt.Size);
                             RecordL2Addition(evt.Time, evt.Price, evt.Size, isBid, orderId);
                         }
                         break;
@@ -509,6 +530,7 @@ namespace MBO_Market_Data_Analytics
                         if (mboOrders.TryGetValue(orderId, out var o))
                         {
                             double nt = ApplyPriceLevelDelta(o.IsBid, o.Ticks, -o.Size);
+                            GridIndexRemove(orderId, o.Size);
                             mboOrders.Remove(orderId);
                             UpdateBest(o.IsBid, o.Ticks, nt);
                             CountBookDec(o.IsBid, o.Ticks);
@@ -519,6 +541,11 @@ namespace MBO_Market_Data_Analytics
                 }
 
                 RefreshBestCounts();
+                if (--mboScanCountdown <= 0)
+                {
+                    gridMaker = ScanForGridMaker();
+                    mboScanCountdown = 40;
+                }
                 AccumulateOfi(pHasBid, pBidT, pBidSz, pHasAsk, pAskT, pAskSz);
                 PruneUnmatchedTrades(evt.Time);
                 PruneMicrostructureCollections(evt.Time);
@@ -684,6 +711,8 @@ namespace MBO_Market_Data_Analytics
         {
             mboOrders.Clear();
             mboAddByOrderId.Clear();
+            ordersBySizeBucket.Clear();
+            gridMaker = default;
             bidCountBook.Clear();
             askCountBook.Clear();
             bestBidOrderCount = 0;
@@ -693,6 +722,97 @@ namespace MBO_Market_Data_Analytics
             bestBidSize = bestAskSize = 0;
             ofiWindow.Clear();
             ofiSum = 0;
+        }
+
+        private static long SizeBucketKey(double size) => (long)Math.Round(size);
+
+        private void GridIndexAdd(string orderId, double size)
+        {
+            long key = SizeBucketKey(size);
+            if (!ordersBySizeBucket.TryGetValue(key, out var set))
+                ordersBySizeBucket[key] = set = new HashSet<string>();
+            set.Add(orderId);
+        }
+
+        private void GridIndexRemove(string orderId, double size)
+        {
+            long key = SizeBucketKey(size);
+            if (ordersBySizeBucket.TryGetValue(key, out var set))
+            {
+                set.Remove(orderId);
+                if (set.Count == 0) ordersBySizeBucket.Remove(key);
+            }
+        }
+
+        private GridMakerResult ScanForGridMaker()
+        {
+            long bestSize = 0;
+            int bestCount = 0;
+            foreach (var kvp in ordersBySizeBucket)
+            {
+                if (kvp.Value.Count > bestCount) { bestCount = kvp.Value.Count; bestSize = kvp.Key; }
+            }
+            if (bestCount < 4) return default;
+
+            var bidTicks = new List<long>();
+            var askTicks = new List<long>();
+            foreach (var id in ordersBySizeBucket[bestSize])
+            {
+                if (mboOrders.TryGetValue(id, out var o))
+                {
+                    if (o.IsBid) bidTicks.Add(o.Ticks);
+                    else askTicks.Add(o.Ticks);
+                }
+            }
+            if (bidTicks.Count < 2 || askTicks.Count < 2) return default;
+
+            bidTicks.Sort();
+            askTicks.Sort();
+
+            double bidReg = MeasureGridSpacing(bidTicks, out int bidSpacing);
+            double askReg = MeasureGridSpacing(askTicks, out int askSpacing);
+
+            if (Math.Abs(bidSpacing - askSpacing) > 1) return default;
+            int spacing = (bidSpacing + askSpacing) / 2;
+            if (spacing < 1) return default;
+
+            double symmetry = (double)Math.Min(bidTicks.Count, askTicks.Count) / Math.Max(bidTicks.Count, askTicks.Count);
+            double levelBonus = Math.Min(1.0, Math.Min(bidTicks.Count, askTicks.Count) / 5.0);
+            double score = bidReg * askReg * Math.Sqrt(symmetry) * levelBonus;
+
+            return new GridMakerResult
+            {
+                OrderSize = bestSize,
+                BidLevels = bidTicks.Count,
+                AskLevels = askTicks.Count,
+                SpacingTicks = spacing,
+                Symmetry = symmetry,
+                Score = score
+            };
+        }
+
+        private static double MeasureGridSpacing(List<long> sortedTicks, out int medianSpacing)
+        {
+            medianSpacing = 0;
+            if (sortedTicks.Count < 2) return 0.0;
+
+            var gaps = new long[sortedTicks.Count - 1];
+            for (int i = 0; i < gaps.Length; i++)
+                gaps[i] = sortedTicks[i + 1] - sortedTicks[i];
+            Array.Sort(gaps);
+            medianSpacing = (int)gaps[gaps.Length / 2];
+            if (medianSpacing <= 0) return 0.0;
+
+            double mean = 0.0;
+            foreach (var g in gaps) mean += g;
+            mean /= gaps.Length;
+
+            double variance = 0.0;
+            foreach (var g in gaps) variance += (g - mean) * (g - mean);
+            variance /= gaps.Length;
+
+            double cv = mean > 0 ? Math.Sqrt(variance) / mean : 1.0;
+            return Math.Max(0.0, 1.0 - cv);
         }
 
         private void CountBookInc(bool isBid, long tick)
@@ -1121,6 +1241,23 @@ namespace MBO_Market_Data_Analytics
 
         public MetricValue GetOfi()
             => CreateMetric(ofiSum, IsL2Warm() ? MetricQuality.Derived : MetricQuality.Unavailable, IsCalibrated);
+
+        // --- 6b. Grid Market Maker Detector ---
+
+        public MetricValue GetGridMakerScore()
+            => CreateMetric(gridMaker.Score, MboMode && IsL2Warm() ? MetricQuality.Derived : MetricQuality.Unavailable, IsCalibrated);
+
+        public MetricValue GetGridMakerBidLevels()
+            => CreateMetric(gridMaker.BidLevels, MboMode && IsL2Warm() ? MetricQuality.Derived : MetricQuality.Unavailable, IsCalibrated);
+
+        public MetricValue GetGridMakerAskLevels()
+            => CreateMetric(gridMaker.AskLevels, MboMode && IsL2Warm() ? MetricQuality.Derived : MetricQuality.Unavailable, IsCalibrated);
+
+        public MetricValue GetGridMakerSpacingTicks()
+            => CreateMetric(gridMaker.SpacingTicks, MboMode && IsL2Warm() ? MetricQuality.Derived : MetricQuality.Unavailable, IsCalibrated);
+
+        public MetricValue GetGridMakerOrderSize()
+            => CreateMetric(gridMaker.OrderSize, MboMode && IsL2Warm() ? MetricQuality.Derived : MetricQuality.Unavailable, IsCalibrated);
 
         // --- 6. VWAP Analytics ---
 

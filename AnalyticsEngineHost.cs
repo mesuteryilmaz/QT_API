@@ -66,6 +66,14 @@ namespace MBO_Market_Data_Analytics
 
         private DateTime lastSessionDate = DateTime.MinValue;
 
+        // Aggressor capability sniffing: on mapped symbols (e.g. MNQU6/IB → dxFeed) the execution
+        // connection (IB) has no TradeAggressor but the mapped data connection (dxFeed) does.
+        // ProbeCapabilities() sees IB → no TradeAggressor. We sniff the first N live trade events
+        // and upgrade the capability if real aggressor flags arrive.
+        private int aggressorProbeTrades = 0;
+        private int aggressorRealCount = 0;
+        private const int AGGRESSOR_PROBE_COUNT = 50;
+
         public bool IsBookValid => isBookValid;
         public bool IsInitialized => initialized;
         public long QueueOverflowCount => Volatile.Read(ref queueOverflowCount);
@@ -219,6 +227,29 @@ namespace MBO_Market_Data_Analytics
             catch (Exception ex)
             {
                 log($"[Self-Warmup] Dynamic volume calibration failed: {ex.Message}", LoggingLevel.Error);
+            }
+        }
+
+        private void ProbeAggressorCapability(AggressorFlag flag)
+        {
+            if (aggressorProbeTrades >= AGGRESSOR_PROBE_COUNT) return;
+            if (Calculator == null) return;
+
+            if (flag == AggressorFlag.Buy || flag == AggressorFlag.Sell)
+                aggressorRealCount++;
+
+            if (++aggressorProbeTrades == AGGRESSOR_PROBE_COUNT)
+            {
+                double coverage = (double)aggressorRealCount / AGGRESSOR_PROBE_COUNT;
+                if (coverage >= 0.5 && !Calculator.Capabilities.HasFlag(FeedCapabilities.TradeAggressor))
+                {
+                    Calculator.GrantCapability(FeedCapabilities.TradeAggressor);
+                    log($"TradeAggressor capability confirmed from live data ({coverage:P0} over first {AGGRESSOR_PROBE_COUNT} trades). Upgrading metric quality.", LoggingLevel.System);
+                }
+                else if (coverage < 0.5)
+                {
+                    log($"TradeAggressor coverage too low ({coverage:P0} over first {AGGRESSOR_PROBE_COUNT} trades). Buyer/seller metrics remain Heuristic.", LoggingLevel.System);
+                }
             }
         }
 
@@ -456,7 +487,10 @@ namespace MBO_Market_Data_Analytics
             CheckSessionRollover(evt.Time);
 
             if (evt.Kind == MarketEventKind.Trade)
+            {
                 Calculator.ProcessTrade(evt.Time, evt.Price, evt.Size, evt.Aggressor);
+                ProbeAggressorCapability(evt.Aggressor);
+            }
             else if (evt.Kind == MarketEventKind.BookLevel)
             {
                 if (Calculator.MboMode && mboBook != null)

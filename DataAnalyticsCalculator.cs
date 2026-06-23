@@ -90,6 +90,9 @@ namespace MBO_Market_Data_Analytics
 
         public FeedCapabilities Capabilities { get; private set; }
 
+        /// <summary>Adds capability flags discovered post-construction (e.g. live aggressor sniffing on mapped symbols).</summary>
+        public void GrantCapability(FeedCapabilities cap) { Capabilities |= cap; }
+
         // Dynamic and Manual Configuration
         public double TradeVolumeWindowShort { get; set; } = 1000;
         public double TradeVolumeWindowLong { get; set; } = 5000;

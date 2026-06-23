@@ -659,6 +659,13 @@ namespace MBO_Market_Data_Analytics
                         : $"voltRatio={ap2?.VolatilityRatio:F2} extremeRatio or spike";
                     Log($"[Regime] {lastRegime} → {currentRegime}: {reason}", StrategyLoggingLevel.Info);
                     lastRegime = currentRegime;
+                    // H-18: expire stale signal latches on StandAside entry so a new confirmation
+                    // is required before the next entry when the regime returns to Normal.
+                    if (currentRegime == RegimeState.StandAside)
+                    {
+                        buySignalActive = false;
+                        sellSignalActive = false;
+                    }
                 }
 
                 if (currentRegime == RegimeState.StandAside)

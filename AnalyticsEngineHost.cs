@@ -106,6 +106,14 @@ namespace MBO_Market_Data_Analytics
 
             if (config.AbsorptionThreshold > 0)
                 Calculator.AbsorptionVolumeThreshold = config.AbsorptionThreshold;
+            else if (config.CalibrationMode == CalibrationMode.Manual)
+            {
+                // H-09: manual mode skips live calibration so the threshold would stay zero, making
+                // every 5s cluster trigger absorption. Derive from the volume window as calibration would.
+                double typical5sVol = shortVol / 12.0;
+                Calculator.AbsorptionVolumeThreshold = Math.Max(10, typical5sVol * 2.0);
+                log($"[Manual] Absorption threshold derived from volume window: {Calculator.AbsorptionVolumeThreshold:F0} contracts/5s.", LoggingLevel.System);
+            }
 
             // Always attempt MBO mode. SeedBookSnapshot downgrades to MBP if the feed returns
             // no per-order snapshot, and ProcessMboEvent falls back gracefully when order IDs
@@ -347,7 +355,9 @@ namespace MBO_Market_Data_Analytics
         private void OnNewLast(Symbol sym, Last last)
         {
             if (!initialized || eventQueue == null || last == null) return;
-            EnqueueEvent(new MarketEvent(DateTime.UtcNow, last.Price, last.Size, last.AggressorFlag));
+            // H-02: prefer feed-reported event time over wall-clock receive time.
+            DateTime eventTime = last.Time != default ? last.Time : DateTime.UtcNow;
+            EnqueueEvent(new MarketEvent(eventTime, last.Price, last.Size, last.AggressorFlag));
         }
 
         private void OnNewLevel2(Symbol sym, Level2Quote level2, DOMQuote dom)
@@ -403,7 +413,10 @@ namespace MBO_Market_Data_Analytics
                         long now = DateTime.UtcNow.Ticks;
                         if (now - lastPublishTicks >= publishIntervalTicks)
                         {
-                            PublishSnapshot();
+                            // H-03: the event already advanced the event clock; passing false prevents
+                            // PublishSnapshot from calling AdvanceTime(wall-clock) which would skew
+                            // currentTicks past any events still buffered in the queue.
+                            PublishSnapshot(advanceTime: false);
                             lastPublishTicks = now;
                             dirty = false;
                         }
@@ -413,7 +426,8 @@ namespace MBO_Market_Data_Analytics
                         long now = DateTime.UtcNow.Ticks;
                         if (now - lastPublishTicks >= publishIntervalTicks)
                         {
-                            PublishSnapshot();
+                            // Idle path: advance time so rolling windows decay during quiet periods.
+                            PublishSnapshot(advanceTime: true);
                             lastPublishTicks = now;
                             dirty = false;
                         }
@@ -598,13 +612,16 @@ namespace MBO_Market_Data_Analytics
 
         #region Snapshot
 
-        public void PublishSnapshot()
+        public void PublishSnapshot(bool advanceTime = true)
         {
             if (Calculator == null) return;
 
             // Decay rolling windows up to the current platform time before sampling, so metrics
             // still age out during quiet periods with no incoming events.
-            Calculator.AdvanceTime(Core.Instance.TimeUtils.DateTimeUtcNow);
+            // H-03: only advance when the queue is idle; skip when events were just processed so
+            // the event clock is not pushed past events that are still buffered in the queue.
+            if (advanceTime)
+                Calculator.AdvanceTime(Core.Instance.TimeUtils.DateTimeUtcNow);
 
             var calc = Calculator;
             currentSnapshot = new AnalyticsSnapshot
@@ -647,7 +664,7 @@ namespace MBO_Market_Data_Analytics
                 RollingVwap15m = calc.GetRollingVwap15m(),
                 SessionVwap = calc.GetSessionVwap(),
                 VwapDistance = calc.GetVwapDistance(),
-                VwapDeviation = calc.GetVwapDeviation(),
+                TradePriceStdDev = calc.GetTradePriceStdDev(),
                 BuyVwap = calc.GetBuyVwap(),
                 SellVwap = calc.GetSellVwap(),
 

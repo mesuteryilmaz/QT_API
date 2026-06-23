@@ -123,7 +123,7 @@ namespace MBO_Market_Data_Analytics
         public MetricValue RollingVwap15m { get; init; }
         public MetricValue SessionVwap { get; init; }
         public MetricValue VwapDistance { get; init; }
-        public MetricValue VwapDeviation { get; init; }
+        public MetricValue TradePriceStdDev { get; init; }  // H-12: renamed from VwapDeviation — unweighted price std dev
         public MetricValue BuyVwap { get; init; }
         public MetricValue SellVwap { get; init; }
 
@@ -382,7 +382,7 @@ namespace MBO_Market_Data_Analytics
                 DrawMetricValueRow(g, "Rolling VWAP (15m)", snapshot.RollingVwap15m, "F2", fontLabel, fontValue, textSecondary, accentBlue, col1X, drawY1, colWidth, isPrice: true);
                 drawY1 += rowHeight;
 
-                DrawMetricCombinedValueRow(g, "Session VWAP / Deviation", snapshot.SessionVwap, "F2", snapshot.VwapDeviation, "F2", fontLabel, fontValue, textSecondary, textPrimary, col1X, drawY1, colWidth, isPrice: true);
+                DrawMetricCombinedValueRow(g, "Session VWAP / Price StdDev", snapshot.SessionVwap, "F2", snapshot.TradePriceStdDev, "F2", fontLabel, fontValue, textSecondary, textPrimary, col1X, drawY1, colWidth, isPrice: true);
                 drawY1 += rowHeight;
 
                 DrawMetricValueRow(g, "VWAP Distance (Ticks)", snapshot.VwapDistance, "F2", fontLabel, fontValue, textSecondary, textPrimary, col1X, drawY1, colWidth);

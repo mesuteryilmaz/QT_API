@@ -158,6 +158,13 @@ namespace MBO_Market_Data_Analytics
         // Dynamic Aggressor Flag Quality Metrics
         private double totalTradesWithAggressor = 0;
 
+        // H-13: last processed trade price from the event stream (for VWAP distance).
+        private double lastTradePrice = 0;
+
+        // H-05: reprice events (order moved price/side) tracked separately from cancel+arrival.
+        private double totalRepriceCount = 0;
+        private double totalRepriceQty = 0;
+
         // H-07: first-event timestamps for window warm-up tracking.
         // A window is only "warm" once its full duration has elapsed since the first event.
         private DateTime? firstTradeTime = null;
@@ -330,6 +337,7 @@ namespace MBO_Market_Data_Analytics
                 sessionPriceSum += price;
                 sessionPriceSumSq += (price * price);
                 sessionPriceCount++;
+                lastTradePrice = price;  // H-13: track last event-stream price for VWAP distance
 
                 PruneUnmatchedTrades(time);
                 PruneMicrostructureCollections(time);
@@ -432,11 +440,20 @@ namespace MBO_Market_Data_Analytics
                 {
                     case MboAction.Add:
                     {
+                        // H-04: idempotent upsert — purge stale state if this order ID already exists
+                        // (duplicate Add from the feed) to prevent double-counting size and order count.
+                        bool isDuplicate = mboOrders.TryGetValue(orderId, out var dup);
+                        if (isDuplicate && dup != null)
+                        {
+                            double purged = ApplyPriceLevelDelta(dup.IsBid, dup.Ticks, -dup.Size);
+                            UpdateBest(dup.IsBid, dup.Ticks, purged);
+                            CountBookDec(dup.IsBid, dup.Ticks);
+                        }
                         double nt = ApplyPriceLevelDelta(isBid, tick, evt.Size);
                         mboOrders[orderId] = new MboLevelRef { Ticks = tick, Size = evt.Size, IsBid = isBid };
                         UpdateBest(isBid, tick, nt);
                         CountBookInc(isBid, tick);
-                        RecordL2Addition(evt.Time, evt.Price, evt.Size, isBid, orderId);
+                        if (!isDuplicate) RecordL2Addition(evt.Time, evt.Price, evt.Size, isBid, orderId);
                         break;
                     }
                     case MboAction.Update:
@@ -457,16 +474,18 @@ namespace MBO_Market_Data_Analytics
                             }
                             else
                             {
-                                // Order moved price or side: remove from old level, add at new
+                                // H-05: order repriced or changed side — update book state but do NOT
+                                // route through HandleL2Reduction+RecordL2Addition, which would inflate
+                                // cancel and arrival counts. Track as a distinct reprice event instead.
                                 double oldTotal = ApplyPriceLevelDelta(existing.IsBid, existing.Ticks, -existing.Size);
                                 UpdateBest(existing.IsBid, existing.Ticks, oldTotal);
                                 CountBookDec(existing.IsBid, existing.Ticks);
-                                HandleL2Reduction(evt.Time, existing.Ticks * ts, existing.Size, existing.IsBid, orderId);
                                 double newTotal = ApplyPriceLevelDelta(isBid, tick, evt.Size);
                                 existing.Ticks = tick; existing.Size = evt.Size; existing.IsBid = isBid;
                                 UpdateBest(isBid, tick, newTotal);
                                 CountBookInc(isBid, tick);
-                                RecordL2Addition(evt.Time, evt.Price, evt.Size, isBid, orderId);
+                                totalRepriceCount++;
+                                totalRepriceQty += evt.Size;
                             }
                         }
                         else
@@ -696,6 +715,9 @@ namespace MBO_Market_Data_Analytics
             totalTradesWithAggressor = 0;  // H-10: missing here caused coverage to exceed 100% after rollover
             firstTradeTime = null;          // H-07: reset warm-up clock on session rollover
             firstL2Time = null;             // H-07
+            lastTradePrice = 0;             // H-13
+            totalRepriceCount = 0;          // H-05
+            totalRepriceQty = 0;            // H-05
 
             totalArrivedOrderCount = 0;
             totalArrivedOrderQty = 0;
@@ -1097,21 +1119,22 @@ namespace MBO_Market_Data_Analytics
 
         public MetricValue GetVwapDistance()
         {
-            double lastPrice = symbol.Last;
-            if (lastPrice <= 0) lastPrice = symbol.Bid > 0 ? symbol.Bid : 1.0;
+            // H-13: use event-stream price instead of live symbol.Last which can be ahead of the
+            // calculator queue and differs in replay.
+            double lastPrice = lastTradePrice;
+            if (lastPrice <= 0) return CreateMetric(0.0, MetricQuality.Exact, IsCalibrated);
             double vwap = GetSessionVwap().Value;
-            if (vwap == 0)
-                return CreateMetric(0.0, MetricQuality.Exact, IsCalibrated);
+            if (vwap == 0) return CreateMetric(0.0, MetricQuality.Exact, IsCalibrated);
 
-            // Expressed in ticks (HUD labels this metric "VWAP Distance (Ticks)").
             double tickSize = symbol.TickSize > 0 ? symbol.TickSize : 1.0;
             double val = (lastPrice - vwap) / tickSize;
             return CreateMetric(val, MetricQuality.Exact, IsCalibrated);
         }
 
-        public MetricValue GetVwapDeviation()
+        // H-12: renamed from GetVwapDeviation — this is unweighted sample std dev of trade prices,
+        // NOT volume-weighted deviation around session VWAP. Name corrected to avoid misleading callers.
+        public MetricValue GetTradePriceStdDev()
         {
-            // Deviation = Standard deviation of trade prices from Session VWAP
             if (sessionPriceCount < 2) return CreateMetric(0.0, MetricQuality.Exact, IsCalibrated);
             double variance = (sessionPriceSumSq - (sessionPriceSum * sessionPriceSum) / sessionPriceCount) / (sessionPriceCount - 1);
             double val = Math.Sqrt(Math.Max(0.0, variance));
@@ -1290,7 +1313,7 @@ private MetricValue CalculateImbalance(int levels)
             "BuyTradeCount60","SellTradeCount60","BuyVolume60","SellVolume60","BuySellCountRatio60","BuySellVolumeRatio60",
             "CumBuyVolume","CumSellVolume","CumDelta","CumTradeCount",
             "Delta1s","Delta5s","Delta30s","Delta60s","DeltaVelocity",
-            "RollingVWAP1m","RollingVWAP5m","RollingVWAP15m","SessionVWAP","VWAPDistance","VWAPDeviation","BuyVWAP","SellVWAP",
+            "RollingVWAP1m","RollingVWAP5m","RollingVWAP15m","SessionVWAP","VWAPDistance","TradePriceStdDev","BuyVWAP","SellVWAP",
             "NewOrderCount","NewBidCount","NewAskCount","NewBidVolume","NewAskVolume",
             "CancelCount","CancelBidCount","CancelAskCount","CancelBidVolume","CancelAskVolume","CancelRatio","CancelVolumeRatio",
             "DOMImbalance3","DOMImbalance5","DOMImbalance10","QueueImbalance","BookPressure",
@@ -1336,7 +1359,7 @@ private MetricValue CalculateImbalance(int levels)
                 F(GetCumBuyVolume().Value), F(GetCumSellVolume().Value), F(GetCumDelta().Value), F(GetCumTradeCount().Value),
                 F(GetDelta1s().Value), F(GetDelta5s().Value), F(GetDelta30s().Value), F(GetDelta60s().Value), F(GetDeltaVelocity().Value),
                 F(GetRollingVwap1m().Value), F(GetRollingVwap5m().Value), F(GetRollingVwap15m().Value), F(GetSessionVwap().Value),
-                F(GetVwapDistance().Value), F(GetVwapDeviation().Value), F(GetBuyVwap().Value), F(GetSellVwap().Value),
+                F(GetVwapDistance().Value), F(GetTradePriceStdDev().Value), F(GetBuyVwap().Value), F(GetSellVwap().Value),
                 F(GetNewOrderCount60().Value), F(GetNewBidCount60().Value), F(GetNewAskCount60().Value), F(GetNewBidVolume60().Value), F(GetNewAskVolume60().Value),
                 F(GetCancelCount60().Value), F(GetCancelBidCount60().Value), F(GetCancelAskCount60().Value), F(GetCancelBidVolume60().Value), F(GetCancelAskVolume60().Value),
                 F(GetCancelRatio60().Value), F(GetCancelVolumeRatio60().Value),
@@ -1403,6 +1426,10 @@ private MetricValue CalculateImbalance(int levels)
 
         public MetricValue GetEstimatedCancelBuyQtyShort() => GetCancelBidVolume60();
         public MetricValue GetEstimatedCancelSellQtyShort() => GetCancelAskVolume60();
+
+        // H-05: reprice events are order-ID modifications that move price/side — distinct from cancel+arrival.
+        public MetricValue GetRepriceCount() => CreateMetric(totalRepriceCount, MboMode ? MetricQuality.Exact : MetricQuality.Unavailable, IsCalibrated);
+        public MetricValue GetRepriceQty() => CreateMetric(totalRepriceQty, MboMode ? MetricQuality.Exact : MetricQuality.Unavailable, IsCalibrated);
 
         public MetricValue GetCumulativeL2RemoveEventCount() => CreateMetric(totalCancelledOrderCount, MetricQuality.Derived, IsCalibrated);
         public MetricValue GetCumulativeEstimatedCancelVwap() => CreateMetric(sessionCancelVwapQty == 0 ? 0 : sessionCancelVwapSumPriceQty / sessionCancelVwapQty, MetricQuality.Heuristic, IsCalibrated);

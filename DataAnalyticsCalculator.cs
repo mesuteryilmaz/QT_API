@@ -884,11 +884,10 @@ namespace MBO_Market_Data_Analytics
 
             double cancelledQty = Math.Max(0, reductionSize - matchTradeQty);
 
-            l2Agg.AddCancellation(time.Ticks, reductionSize, isBid);
-            totalCancelledOrderCount++;
-
             if (cancelledQty > 0)
             {
+                l2Agg.AddCancellation(time.Ticks, cancelledQty, isBid);
+                totalCancelledOrderCount++;
                 totalCancelledOrderQty += cancelledQty;
                 if (isBid)
                 {
@@ -985,7 +984,9 @@ namespace MBO_Market_Data_Analytics
         private MetricValue CreateMetric(double value, MetricQuality quality, bool isWarm)
         {
             long receiveTicks = System.Diagnostics.Stopwatch.GetTimestamp();
-            long eventTimeNs = currentTicks * 100;
+            // currentTicks is DateTime.Ticks (100-ns intervals since year 1).
+            // Subtracting UnixEpoch before multiplying avoids signed-64 overflow on 2026+ dates.
+            long eventTimeNs = (currentTicks - DateTime.UnixEpoch.Ticks) * 100L;
             return new MetricValue(value, quality, eventTimeNs, receiveTicks, isWarm);
         }
 

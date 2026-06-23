@@ -22,8 +22,11 @@ namespace MBO_Market_Data_Analytics
         public readonly long Priority;
         public readonly int NumberOrders;
         public readonly string OrderId;
+        /// <summary>For Trade events: false when the feed did not report Buy or Sell (None/NotSet).
+        /// IsBid is unreliable when this is false.</summary>
+        public readonly bool IsAggressorKnown;
 
-        public MboEvent(long seq, DateTime time, MboAction action, bool isBid, double price, double size, long priority, int numberOrders, string orderId)
+        public MboEvent(long seq, DateTime time, MboAction action, bool isBid, double price, double size, long priority, int numberOrders, string orderId, bool isAggressorKnown = true)
         {
             Seq = seq;
             Time = time;
@@ -34,6 +37,7 @@ namespace MBO_Market_Data_Analytics
             Priority = priority;
             NumberOrders = numberOrders;
             OrderId = orderId;
+            IsAggressorKnown = isAggressorKnown;
         }
     }
 
@@ -116,11 +120,11 @@ namespace MBO_Market_Data_Analytics
             return new MboEvent(s, time, MboAction.Snapshot, isBid, price, size, priority, numberOrders, key);
         }
 
-        /// <summary>Emits a Trade event (does not modify the resting book). IsBid = buy-aggressor.</summary>
-        public MboEvent ApplyTrade(DateTime time, bool isBuyAggressor, double price, double size)
+        /// <summary>Emits a Trade event (does not modify the resting book). IsBid = buy-aggressor; isAggressorKnown = false when feed reports Unknown.</summary>
+        public MboEvent ApplyTrade(DateTime time, bool isBuyAggressor, bool isAggressorKnown, double price, double size)
         {
             long s = ++seq;
-            return new MboEvent(s, time, MboAction.Trade, isBuyAggressor, price, size, 0, 0, "");
+            return new MboEvent(s, time, MboAction.Trade, isBuyAggressor, price, size, 0, 0, "", isAggressorKnown);
         }
 
         private string SyntheticKey(bool isBid, double price)

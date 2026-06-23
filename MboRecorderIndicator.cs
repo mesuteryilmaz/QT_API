@@ -137,10 +137,11 @@ namespace MBO_Market_Data_Analytics
         {
             if (last == null || book == null) return;
             bool buyAgg = last.AggressorFlag == AggressorFlag.Buy;
+            bool aggKnown = last.AggressorFlag == AggressorFlag.Buy || last.AggressorFlag == AggressorFlag.Sell;
             MboEvent e;
             lock (bookLock)
             {
-                e = book.ApplyTrade(DateTime.UtcNow, buyAgg, last.Price, last.Size);
+                e = book.ApplyTrade(DateTime.UtcNow, buyAgg, aggKnown, last.Price, last.Size);
             }
             recorder?.Record(e);
             System.Threading.Interlocked.Increment(ref eventCount);

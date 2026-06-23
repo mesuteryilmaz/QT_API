@@ -139,11 +139,12 @@ namespace MBO_Market_Data_Analytics
         {
             // orderId is feed-controlled; strip commas defensively.
             string id = e.OrderId?.Replace(",", "") ?? "";
+            string side = (e.Action == MboAction.Trade && !e.IsAggressorKnown) ? "U" : (e.IsBid ? "B" : "A");
             return string.Concat(
                 e.Seq.ToString(CI), ",",
                 e.Time.ToString("o", CI), ",",
                 e.Action.ToString(), ",",
-                (e.IsBid ? "B" : "A"), ",",
+                side, ",",
                 e.Price.ToString("R", CI), ",",
                 e.Size.ToString("R", CI), ",",
                 e.Priority.ToString(CI), ",",

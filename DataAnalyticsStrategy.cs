@@ -559,7 +559,7 @@ namespace MBO_Market_Data_Analytics
             {
                 // Live-only Max Daily Loss guard. currentPositionSize carries the sign, so
                 // currentPositionSize * (lastPrice - averageEntryPrice) * pointCost is correct both ways.
-                if (wantLive && lastPrice > 0.0 && currentPositionSize != 0.0)
+                if (wantLive && lastPrice > 0.0)
                 {
                     double pointCost = GetPointCost();
                     double openPnL = currentPositionSize * (lastPrice - averageEntryPrice) * pointCost;

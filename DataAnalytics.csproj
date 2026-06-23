@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <AssemblyName>MBO_Market_Data_Analytics</AssemblyName>
+    <RootNamespace>TradingPlatform.BusinessLayer</RootNamespace>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="TradingPlatform.BusinessLayer">
+      <HintPath>C:\Quantower\TradingPlatform\v1.146.13\bin\TradingPlatform.BusinessLayer.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="AdaptiveParameters.cs" />
+    <Compile Include="AnalyticsEngineHost.cs" />
+    <Compile Include="ShadowSimulator.cs" />
+    <Compile Include="MboOrderBook.cs" />
+    <Compile Include="MboRecorder.cs" />
+    <Compile Include="MboRecorderIndicator.cs" />
+    <Compile Include="DataAnalyticsCalculator.cs" />
+    <Compile Include="DataAnalyticsIndicator.cs" />
+    <Compile Include="DataAnalyticsStrategy.cs" />
+    <Compile Include="ReplayBacktester.cs" />
+    <Compile Include="ReplayBacktestIndicator.cs" />
+  </ItemGroup>
+  <Target Name="PostBuild" AfterTargets="PostBuildEvent">
+    <Copy SourceFiles="$(OutputPath)$(AssemblyName).dll" DestinationFolder="C:\Quantower\Settings\Scripts\Indicators\" SkipUnchangedFiles="false" />
+    <Copy SourceFiles="$(OutputPath)$(AssemblyName).dll" DestinationFolder="C:\Quantower\Settings\Scripts\Strategies\" SkipUnchangedFiles="false" />
+  </Target>
+</Project>

@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8</TargetFramework>
+    <BaseOutputPath></BaseOutputPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Remove="HTML\layout.html" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="HTML\layout.html" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="TradingPlatform.BusinessLayer">
+      <HintPath>..\..\..\..\..\..\QuantowerVersions\Quantower\TradingPlatform\v1.141.15\bin\TradingPlatform.BusinessLayer.dll</HintPath>
+    </Reference>
+    <Reference Include="TradingPlatform.PresentationLayer.Plugins">
+      <HintPath>..\..\..\..\..\..\QuantowerVersions\Quantower\TradingPlatform\v1.141.15\bin\TradingPlatform.PresentationLayer.Plugins.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+</Project>

@@ -166,7 +166,11 @@ namespace MBO_Market_Data_Analytics
         private int consecutiveOrderFailures = 0;
 
         // Cross-thread flags (volatile: read on worker thread, written on callback threads)
-        private volatile bool isConnectionActive = true;
+        // Data (dxFeed) and execution (IBKR) are separate connections and tracked independently.
+        private volatile bool isDataConnectionActive = false;
+        private volatile bool isExecutionConnectionActive = false;
+        // Entries require both connections. Reconciliation and bracket management only need execution.
+        private bool isConnectionActive => isDataConnectionActive && isExecutionConnectionActive;
         private volatile bool isRiskHalted = false;
 
         // Diagnostic logging state (worker thread only)
@@ -187,7 +191,11 @@ namespace MBO_Market_Data_Analytics
             return OrderRole.Reconciled;
         }
 
-        public override string[] MonitoringConnectionsIds => new[] { this.CurrentSymbol?.ConnectionId ?? "" };
+        public override string[] MonitoringConnectionsIds => new[]
+        {
+            this.CurrentSymbol?.ConnectionId ?? "",
+            this.CurrentAccount?.ConnectionId ?? ""
+        };
 
         public DataAnalyticsStrategy() : base()
         {
@@ -287,12 +295,21 @@ namespace MBO_Market_Data_Analytics
             Core.PositionAdded += OnCorePositionAdded;
             Core.PositionRemoved += OnCorePositionRemoved;
 
-            // Subscribe to connection status changes
-            var connection = Core.Instance.Connections.Connected.FirstOrDefault(c => c.Id == CurrentSymbol.ConnectionId);
-            if (connection != null)
+            // Subscribe to data connection (dxFeed) and execution connection (IBKR) separately.
+            var dataConn = Core.Instance.Connections.Connected.FirstOrDefault(c => c.Id == CurrentSymbol.ConnectionId);
+            if (dataConn != null)
             {
-                connection.StateChanged += OnConnectionStateChanged;
-                isConnectionActive = connection.State == ConnectionState.Connected;
+                dataConn.StateChanged += OnConnectionStateChanged;
+                isDataConnectionActive = dataConn.State == ConnectionState.Connected;
+            }
+
+            var execConn = Core.Instance.Connections.Connected.FirstOrDefault(c => c.Id == CurrentAccount.ConnectionId);
+            if (execConn != null)
+            {
+                // Only subscribe once — if both connections share the same ID they share one handler.
+                if (execConn.Id != dataConn?.Id)
+                    execConn.StateChanged += OnConnectionStateChanged;
+                isExecutionConnectionActive = execConn.State == ConnectionState.Connected;
             }
 
             // Perform initial reconciliation
@@ -307,14 +324,13 @@ namespace MBO_Market_Data_Analytics
             Core.PositionAdded -= OnCorePositionAdded;
             Core.PositionRemoved -= OnCorePositionRemoved;
 
-            // Unsubscribe from connection state changes
-            if (this.CurrentSymbol != null)
+            // Unsubscribe from all monitored connections.
+            var dataConnId = this.CurrentSymbol?.ConnectionId;
+            var execConnId = this.CurrentAccount?.ConnectionId;
+            foreach (var conn in Core.Instance.Connections.Connected)
             {
-                var connection = Core.Instance.Connections.Connected.FirstOrDefault(c => c.Id == CurrentSymbol.ConnectionId);
-                if (connection != null)
-                {
-                    connection.StateChanged -= OnConnectionStateChanged;
-                }
+                if (conn.Id == dataConnId || conn.Id == execConnId)
+                    conn.StateChanged -= OnConnectionStateChanged;
             }
 
             // Stop the analytics engine (also tears down its worker thread feeding signals)
@@ -1271,26 +1287,47 @@ namespace MBO_Market_Data_Analytics
 
         private void OnConnectionStateChanged(object? sender, ConnectionStateChangedEventArgs e)
         {
+            string? changedId = (sender as Connection)?.Id;
+            bool isExec = changedId == CurrentAccount?.ConnectionId;
+            bool isData = changedId == CurrentSymbol?.ConnectionId;
+
             if (e.NewState == ConnectionState.Connected)
             {
-                Log("Broker Connection Re-established. Triggering reconciliation...", StrategyLoggingLevel.Info);
-                ReconcileBrokerState();
+                if (isData) isDataConnectionActive = true;
+                if (isExec)
+                {
+                    isExecutionConnectionActive = true;
+                    Log("Execution (broker) connection re-established. Triggering reconciliation...", StrategyLoggingLevel.Info);
+                    ReconcileBrokerState();
+                }
+                else if (isData)
+                {
+                    Log("Data connection re-established.", StrategyLoggingLevel.Info);
+                }
             }
             else if (e.NewState == ConnectionState.Disconnected || e.NewState == ConnectionState.Fail)
             {
-                Log("Broker Connection Lost. Pausing strategy execution...", StrategyLoggingLevel.Error);
-                isConnectionActive = false;
+                if (isData)
+                {
+                    isDataConnectionActive = false;
+                    Log("Data connection lost. New entries paused; open position management continues.", StrategyLoggingLevel.Error);
+                }
+                if (isExec)
+                {
+                    isExecutionConnectionActive = false;
+                    Log("Execution (broker) connection lost. All order placement paused.", StrategyLoggingLevel.Error);
+                }
             }
         }
 
         private void ReconcileBrokerState()
         {
-            var connection = Core.Instance.Connections.Connected.FirstOrDefault(c => c.Id == CurrentSymbol.ConnectionId);
-            isConnectionActive = connection != null && connection.State == ConnectionState.Connected;
+            var execConn = Core.Instance.Connections.Connected.FirstOrDefault(c => c.Id == CurrentAccount.ConnectionId);
+            isExecutionConnectionActive = execConn != null && execConn.State == ConnectionState.Connected;
 
-            if (!isConnectionActive)
+            if (!isExecutionConnectionActive)
             {
-                Log("[Reconciliation] Skipped because connection is not active.", StrategyLoggingLevel.Info);
+                Log("[Reconciliation] Skipped — execution (broker) connection is not active.", StrategyLoggingLevel.Info);
                 return;
             }
 

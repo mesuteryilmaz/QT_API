@@ -299,7 +299,7 @@ The project targets **.NET 10.0 (Windows)** and builds a single assembly,
 | `AnalyticsEngineHost.cs` | Shared host (composition). Owns the background worker thread, bounded event queue with overflow recovery, capability probing, auto-MTR warmup, initial book seed with self-healing fallback, CME session-rollover detection, snapshot publishing, and optional feature-store export. |
 | `DataAnalyticsIndicator.cs` | Quantower `Indicator`. Owns an `AnalyticsEngineHost`, renders the GDI+ HUD from the double-buffered snapshot. Also defines the shared `MarketEvent`, `AnalyticsSnapshot`, `CalibrationMode`, and `MetricValue` types. |
 | `DataAnalyticsStrategy.cs` | Quantower `Strategy`. Owns an `AnalyticsEngineHost`, runs execution/risk/bracket logic via the host's per-event hook. |
-| `AdaptiveParameters.cs` | Phase 1 self-tuning controller: rolling-percentile entry thresholds + ATR-scaled brackets with a warmup gate. |
+| `AdaptiveParameters.cs` | Phase 1–3 adaptive stack: rolling-percentile thresholds + ATR brackets (Phase 1); lag-1 ACF polarity selection — Momentum / MeanReversion (Phase 2); regime classifier — volatility spike, extreme ratio, thin-queue stand-aside gates (Phase 3). |
 | `ShadowSimulator.cs` | Paper-fill simulator + performance tracker for the shadow→live execution envelope. |
 | `MboOrderBook.cs` | Order-keyed (MBO) book reconstruction + normalized `MboEvent` model. |
 | `MboRecorder.cs` | Async, batched, daily-rotated CSV recorder for the normalized MBO stream. |
@@ -492,9 +492,11 @@ no log output, making it impossible to distinguish "running but warming up" from
 | `!IsBookValid` | 30 s | "L2 book not yet seeded — no signals yet." |
 | `!IsCalibrated` | 30 s | "engine calibrating (MTR warmup) — no signals yet." |
 | Adaptive controller warming up | 30 s | Sample count and warmup progress |
-| Adaptive controller first ready | once | Buy/sell thresholds, ATR, TP/SL, sample count |
+| Adaptive controller first ready | once | Buy/sell thresholds, ATR, TP/SL, sample count, initial polarity |
+| Polarity transition | on change | `Momentum → MeanReversion (ACF=−0.234). Signal state reset.` |
+| Regime transition | on change | `Normal → StandAside: thin queue (1 orders at best)` |
 | Ratio not usable | 60 s | IsWarm and Quality values |
-| Active evaluation | 60 s | Current ratio vs thresholds + shadow trade summary |
+| Active evaluation | 60 s | Current ratio vs thresholds, polarity, shadow trade summary |
 
 Log entries appear in the Quantower Strategy log panel and the daily `.slog` file
 under `Scripts\ScriptsData\<strategy-instance>\logs\`.
@@ -547,8 +549,9 @@ The dashboard overlay renders two columns plus a diagnostics footer:
   - **3. Delta & Velocity** — delta 1s/5s/30s/60s, delta velocity.
 - **Column 2**
   - **4. DOM Imbalances & Pressure** — queue imbalance (best bid/ask), 3/5/10-level
-    imbalance, order-book pressure (distance-weighted). All near-zero for full-size
-    NQ; more active on MNQ. See DOM imbalance behavior note above.
+    imbalance, order-book pressure (distance-weighted); **Best Bid / Best Ask order
+    count** (MBO exact; Unavailable in MBP). All imbalance values near-zero for
+    full-size NQ; more active on MNQ. See DOM imbalance behavior note above.
   - **5. Order Arrivals & Cancels (60s)** — new orders B/A count & volume,
     cancel orders B/A count & volume, cancel ratio (count & volume).
   - **6. Microstructure Events** — absorption buy/sell (5s), iceberg, replenishment
@@ -619,32 +622,62 @@ shared engine.
   in `OnStop()` / `OnClear()` releases Quantower's Serilog file handles to avoid
   `.slog` sharing violations when the script is removed.
 
-### Adaptive parameters (Phase 1 of the regime roadmap)
+### Adaptive parameters — three-phase self-tuning stack
 
 `Parameter Mode` selects between **Static** (the fixed operator inputs) and
 **Adaptive** (self-tuning), implemented by `AdaptiveParameterController`
-(`AdaptiveParameters.cs`). In Adaptive mode:
+(`AdaptiveParameters.cs`). In Adaptive mode the controller runs three cooperating
+phases on the same 2-second recalc cycle:
 
-- **Data-driven entry thresholds** — instead of the fixed 1.5 / 0.67 ratio cut-offs,
-  the controller samples the live buyer/seller volume ratio on a cadence and uses
+#### Phase 1 — data-driven entry thresholds + ATR-scaled brackets
+
+- **Entry thresholds** — instead of the fixed 1.5 / 0.67 ratio cut-offs, the
+  controller samples the live buyer/seller volume ratio at 250 ms intervals and uses
   rolling **percentiles** of that distribution (upper = `Adaptive Entry Percentile`,
-  lower = `1 −` that). The hysteresis re-arm level is the running **median**. This
-  adapts to each instrument and to intraday conditions automatically.
+  lower = `1 −` that). The hysteresis re-arm level is the running **median**.
 - **ATR-scaled brackets** — TP/SL distances are `round(ATR_ticks × multiplier)`,
-  clamped to a sane range, so risk is consistent across volatility regimes. The ATR
-  is seeded from 1-minute history at start and refined live with Wilder smoothing.
-- **Warmup gate** — until the controller has both an ATR estimate *and* enough ratio
-  samples (~2 minutes), it reports *not ready* and the strategy **stands aside**
-  (examines analytics, places no trades). Progress is logged every 30 s.
+  clamped between `MinBracketTicks` and `MaxBracketTicks`, so risk is consistent
+  across volatility regimes. Two ATRs are maintained via Wilder smoothing: a
+  **baseline** (14-min period, seeded from history) and a **fast** (5-min period,
+  seeded to the same initial value and allowed to diverge as live bars arrive).
+- **Warmup gate** — until both an ATR estimate and enough ratio samples (~2 min) are
+  available, the controller reports *not ready* and the strategy stands aside.
+  Progress is logged every 30 s.
 
-**Phase 1 keeps the existing momentum polarity** (buy when buyers dominate); it adapts
-only the *magnitudes* (thresholds and bracket sizes). Automatic **polarity selection**
-(momentum vs mean-reversion, "let the regime decide") and a full **regime classifier**
-(volatility / trend-vs-range / liquidity, with stand-aside gating in extreme regimes)
-are later phases that will set these same parameters from the detected regime.
+#### Phase 2 — polarity selection (momentum vs mean-reversion)
 
-Static mode reproduces the previous fixed-parameter behavior exactly, so it remains
-fully backward-compatible.
+Each recalc cycle computes the **lag-1 Pearson autocorrelation** of the most recent
+60 ratio samples (~15 s). The autocorrelation measures whether the ratio tends to
+persist (positive → momentum) or revert (negative → mean-reversion):
+
+- `ACF > +0.10` → `Polarity = Momentum` — buy when buyers dominate, sell when sellers
+  dominate.
+- `ACF < −0.10` → `Polarity = MeanReversion` — buy when sellers dominate (expecting a
+  bounce), sell when buyers dominate (expecting a fade). Entry and reset thresholds are
+  the same values; only the signal direction is inverted.
+- `ACF ∈ [−0.10, +0.10]` → current polarity is held (hysteresis band prevents
+  rapid flip-flopping in ambiguous conditions).
+
+On a polarity transition the strategy logs `Momentum → MeanReversion (ACF=−0.234)`,
+resets both signal flags, and immediately re-evaluates on the next tick.
+
+#### Phase 3 — regime classifier (stand-aside gate)
+
+Three gates are evaluated each recalc cycle. Any gate firing sets `Regime = StandAside`
+and the strategy skips all new signal entries (exits still process normally):
+
+| Gate | Condition | Tunable input |
+|------|-----------|---------------|
+| **Volatility spike** | `fastATR / baselineATR > VolatilityGateRatio` | `Volatility Gate Ratio` (default 1.5) |
+| **Extreme ratio** | Last ratio > 97th or < 3rd percentile of distribution | Config only (`ExtremeUpperPercentile` / `ExtremeLowerPercentile`) |
+| **Thin queue** (MBO only, per-tick) | `bestBidOrders + bestAskOrders ≤ threshold` | `Thin Queue Stand-Aside` (default 2; 0 = disabled) |
+
+The thin-queue gate only fires when best-level order count quality is `Exact` (MBO
+mode); it is automatically disabled in MBP mode. Regime transitions are logged with
+the triggering reason (`thin queue (1 orders at best)` / `voltRatio=2.1 extreme`).
+
+Static mode reproduces the previous fixed-parameter behavior exactly and is fully
+backward-compatible.
 
 ### Execution envelope — shadow (paper) → promotion gate
 
@@ -659,11 +692,13 @@ depth — the strategy validates itself forward on the live tape.
 - **Shadow only.** Pure forward paper test; never routes to IB.
 - **Live only.** Routes to IB immediately — the legacy behavior, no gate.
 
-**Paper fill model.** One bracketed position at a time. Entries fill *aggressively at the far
-touch* (buy at ask / sell at bid, + slippage) — pessimistic and reproducible without an MBO
-queue model, so paper PnL doesn't flatter itself. Stop exits fill at the stop (+ slippage),
-take-profit at the limit. Costs = commission per contract (both sides) + the spread paid on
-entry.
+**Paper fill model.** One bracketed position at a time. Entries normally fill
+*aggressively at the far touch* (buy at ask / sell at bid, + slippage) — pessimistic
+and reproducible. **Queue-aware exception:** when MBO mode is active and the total
+order count at the best level is ≤ 2 (thin queue), the entry fills at the **mid-price**
+instead, reflecting the higher probability of getting a fill near mid when there is
+minimal resting interest. Stop exits fill at the stop (+ slippage), take-profit at the
+limit. Costs = commission per contract (both sides) + the spread paid on entry.
 
 **The gate has teeth (not just "made money lately").** Promotion requires: trades ≥
 `Promotion Min Trades`, mean PnL ≥ `Promotion Min Expectancy`, **and** a positive one-sided
@@ -721,10 +756,13 @@ a queue-aware fill model arrives with MBO ingestion).
 | Promotion/Demotion Confidence Z | 1.64 | LCB z (≈95% one-sided) |
 | Promotion Min Expectancy ($/trade) | 0.0 | Min mean net PnL per trade to promote |
 | Demotion Min Trades | 20 | Min live trades before demotion can trigger |
+| Volatility Gate Ratio (fastATR/ATR) | 1.5 | Phase 3: regime stand-aside when `fastATR / baselineATR` exceeds this (Adaptive mode only) |
+| Thin Queue Stand-Aside (MBO orders) | 2 | Phase 3: stand aside when `bestBidOrders + bestAskOrders ≤` this (MBO only; 0 = disabled) |
 
 > In **Static** mode the ratio thresholds and TP/SL tick inputs above are used
 > directly. In **Adaptive** mode they are superseded by the controller (the static
 > values still apply as the fallback before warmup completes for bracket sizing).
+> Phase 2 (polarity) and Phase 3 (regime classifier) are only active in Adaptive mode.
 
 ---
 
@@ -798,9 +836,10 @@ of `NumberOrders` per quote: ≈1 ⇒ true per-order MBO, >1 ⇒ the feed is pri
 - **CSV** is the first format (simple, inspectable). At sustained very high MBO rates a binary
   format would be smaller/faster — a future optimization; the async + overflow-drop design
   protects the feed in the meantime.
-- This records and reconstructs the book; **wiring order-level features (queue position,
-  per-order cancellation) into the live calculator** is the next step (it replaces the current
-  price-aggregated ingestion behind a toggle).
+- This records and reconstructs the book. Order-level features are now wired into the live
+  calculator: per-order spoof detection, best-level order counts, and the queue-aware fill
+  model all use the MBO stream. The recorder remains the tool for building an offline
+  research corpus from the live feed.
 
 > **Note:** the rolling-window definitions in this document's earlier sections
 > (60-second / 5-minute) describe the original specification. The implemented engine

@@ -68,9 +68,16 @@ Key inputs (full tables in [`DataAnalytics.md`](DataAnalytics.md#configuration-r
   (demoting back to paper if live performance degrades); *Shadow only* never trades live;
   *Live only* is the legacy immediate-execution behavior. No historical data needed — the
   strategy validates itself forward ("on-the-job").
-- **Parameter Mode** (strategy) — *Adaptive* self-tunes entry thresholds from rolling
-  percentiles of order flow and sizes brackets from live ATR, standing aside during a
-  short warmup; *Static* uses the fixed threshold/tick inputs (previous behavior).
+- **Parameter Mode** (strategy) — *Adaptive* drives a three-phase self-tuning stack:
+  **Phase 1** derives entry thresholds from rolling percentiles of the live
+  buyer/seller ratio and sizes TP/SL from live ATR; **Phase 2** adds a rolling lag-1
+  autocorrelation check on the ratio series and automatically flips between *momentum*
+  (buy when buyers dominate) and *mean-reversion* (buy when sellers dominate, expecting
+  a bounce) when the flow character changes; **Phase 3** adds a regime classifier —
+  a volatility-spike gate (fast ATR vs baseline ATR), an extreme-ratio gate (beyond the
+  97th/3rd percentile), and a thin-queue gate (MBO order count at best level) — that
+  causes the strategy to stand aside entirely rather than trade a degraded signal.
+  *Static* uses the fixed threshold/tick inputs (previous behavior).
 - **Calibration Mode** — *Auto (MTR)* calibrates window sizes from recent volume;
   *Manual* uses the L2 window inputs directly.
 - **Absorption Volume Threshold (5s contracts)** — minimum 5-second volume required
@@ -83,6 +90,10 @@ Key inputs (full tables in [`DataAnalytics.md`](DataAnalytics.md#configuration-r
 - Strategy risk inputs — Order Quantity, Take Profit / Stop Loss (ticks), Max
   Exposure, Max Daily Loss, ratio buy/sell thresholds (+ hysteresis reset band),
   Max Consecutive Failures, Order Cooldown.
+- **Volatility Gate Ratio** (strategy) — `fastATR / baselineATR` threshold above which
+  the regime classifier fires a stand-aside (default 1.5). Only active in Adaptive mode.
+- **Thin Queue Stand-Aside** (strategy) — total order count at best bid + best ask
+  below this threshold triggers a stand-aside (default 2, MBO mode only; 0 = disabled).
 
 > **Trading risk:** the strategy places live orders. Validate on a **paper / sim
 > account** first. The build machine has no market feed, so behavior can only be
@@ -198,7 +209,7 @@ Key inputs (full tables in [`DataAnalytics.md`](DataAnalytics.md#configuration-r
 ```
 DataAnalyticsCalculator.cs   Pure analytics engine (aggregators, metrics, order book)
 AnalyticsEngineHost.cs       Shared host: worker, queue, calibration, snapshots, book seed
-AdaptiveParameters.cs        Phase 1 self-tuning thresholds + ATR brackets
+AdaptiveParameters.cs        Phase 1–3 adaptive stack: self-tuning thresholds, ATR brackets, polarity selection, regime classifier
 ShadowSimulator.cs           Paper-fill sim + perf tracker (shadow→live gate)
 ReplayBacktester.cs          Trade-replay backtester (pure; reuses live engine)
 ReplayBacktestIndicator.cs   On-chart backtester launcher + report panel

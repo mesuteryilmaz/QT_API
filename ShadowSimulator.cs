@@ -103,9 +103,11 @@ namespace MBO_Market_Data_Analytics
 
     /// <summary>
     /// Paper-trades the strategy's signals against the live tape without touching the broker. Models a
-    /// single bracketed position at a time. Entries fill aggressively at the far touch (pay the spread)
-    /// — pessimistic and reproducible without an MBO queue model; stop exits fill at the stop price
-    /// (+ slippage), take-profit at the limit price. Net-of-cost PnL accrues to <see cref="Performance"/>.
+    /// single bracketed position at a time. Entries fill at the near-touch (bid for buys, ask for sells)
+    /// to match live passive limit order placement — the same price the live strategy uses. Fill
+    /// probability is not modelled: shadow always fills immediately, while live passive orders may not
+    /// fill if the market moves away. Stop exits fill at the stop price (+ slippage), take-profit at the
+    /// limit price. Net-of-cost PnL accrues to <see cref="Performance"/>.
     ///
     /// Single-threaded by contract: only ever driven from the strategy's worker thread.
     /// </summary>
@@ -148,35 +150,33 @@ namespace MBO_Market_Data_Analytics
             => pos == 0 && (now - lastExit).TotalSeconds >= cfg.CooldownSeconds;
 
         /// <summary>
-        /// Enters a paper position. When bestOrderCount ≤ 2 (thin queue), fills at mid rather than far touch.
-        /// Returns false if not flat.
+        /// Enters a paper position. Fills at the near-touch (bid for buys, ask for sells) — the same
+        /// price the live strategy's passive limit order is placed at. Returns false if not flat.
         /// </summary>
-        public bool Enter(Side side, double bid, double ask, int tpTicks, int slTicks, DateTime now, int bestOrderCount = 0)
+        public bool Enter(Side side, double bid, double ask, int tpTicks, int slTicks, DateTime now)
         {
             if (pos != 0) return false;
 
             double ts = cfg.TickSize > 0 ? cfg.TickSize : 1.0;
             double slip = cfg.SlippageTicks * ts;
-            bool thinQueue = bestOrderCount > 0 && bestOrderCount <= 2;
-            double mid = (bid + ask) / 2.0;
 
             if (side == Side.Buy)
             {
-                double farTouch = ask > 0 ? ask : bid;
-                if (farTouch <= 0) return false;
-                double fill = thinQueue ? mid : farTouch;
+                // Near-touch for a passive buy limit: bid price.
+                double nearTouch = bid > 0 ? bid : ask;
+                if (nearTouch <= 0) return false;
                 pos = +1;
-                entry = fill + slip;
+                entry = nearTouch + slip;
                 tp = tpTicks > 0 ? entry + tpTicks * ts : double.PositiveInfinity;
                 sl = slTicks > 0 ? entry - slTicks * ts : double.NegativeInfinity;
             }
             else
             {
-                double farTouch = bid > 0 ? bid : ask;
-                if (farTouch <= 0) return false;
-                double fill = thinQueue ? mid : farTouch;
+                // Near-touch for a passive sell limit: ask price.
+                double nearTouch = ask > 0 ? ask : bid;
+                if (nearTouch <= 0) return false;
                 pos = -1;
-                entry = fill - slip;
+                entry = nearTouch - slip;
                 tp = tpTicks > 0 ? entry - tpTicks * ts : double.NegativeInfinity;
                 sl = slTicks > 0 ? entry + slTicks * ts : double.PositiveInfinity;
             }

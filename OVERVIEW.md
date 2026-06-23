@@ -210,11 +210,13 @@ LCB (lower confidence bound) gate properties:
   • Luck-resistant: a lucky streak with high variance doesn't promote
 ```
 
-The paper fill model is deliberately pessimistic:
-- Normal queue: fill at far touch (buy at ask, sell at bid) + slippage
-- Thin queue (MBO: ≤ 2 orders at best): fill at mid-price
+The paper fill model uses the same entry price as live orders:
+- Entry: fill at near-touch (buy at bid, sell at ask) + slippage — same price as the live passive limit
 - Stop exits: fill at stop price + slippage
-- Cost model: commission both sides + spread paid on entry
+- Cost model: commission both sides
+- Known limitation: fill probability is not modelled. Shadow always fills immediately; live passive
+  limits may not fill if the market moves away. The thin-queue stand-aside gate (Phase 3, Gate C)
+  prevents shadow from entering when the queue is too thin to expect a fill.
 
 ---
 

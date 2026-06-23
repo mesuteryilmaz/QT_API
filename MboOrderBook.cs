@@ -62,6 +62,15 @@ namespace MBO_Market_Data_Analytics
         private readonly Dictionary<string, Order> orders = new Dictionary<string, Order>();
         private readonly Dictionary<long, double> bidSizeByTick = new Dictionary<long, double>();
         private readonly Dictionary<long, int> bidCountByTick = new Dictionary<long, int>();
+
+        // C-04: track real-ID vs synthetic-ID event counts to verify feed MBO capability.
+        private int realIdEvents;
+        private int syntheticIdEvents;
+        public int RealIdEvents => realIdEvents;
+        public int SyntheticIdEvents => syntheticIdEvents;
+        public double RealIdCoverage => (realIdEvents + syntheticIdEvents) == 0
+            ? 0.0 : (double)realIdEvents / (realIdEvents + syntheticIdEvents);
+        public void ResetCoverageCounters() { realIdEvents = 0; syntheticIdEvents = 0; }
         private readonly Dictionary<long, double> askSizeByTick = new Dictionary<long, double>();
         private readonly Dictionary<long, int> askCountByTick = new Dictionary<long, int>();
 
@@ -89,7 +98,9 @@ namespace MBO_Market_Data_Analytics
         public MboEvent Apply(DateTime time, string? id, bool isBid, double price, double size, long priority, int numberOrders, bool closed)
         {
             long s = ++seq;
-            string key = !string.IsNullOrEmpty(id) ? id! : SyntheticKey(isBid, price);
+            bool hasRealId = !string.IsNullOrEmpty(id);
+            if (hasRealId) realIdEvents++; else syntheticIdEvents++;
+            string key = hasRealId ? id! : SyntheticKey(isBid, price);
 
             MboAction action;
             if (closed || size <= 0)

@@ -113,11 +113,22 @@ namespace MBO_Market_Data_Analytics
             Calculator.MboMode = true;
             mboBook = new MboOrderBook(symbol.TickSize);
 
+            // C-01: subscribe and open the queue BEFORE requesting the snapshot so that no
+            // exchange updates are lost during the seed window. Events buffer in the queue
+            // while SeedBookSnapshot() runs on this thread; the worker starts after the
+            // snapshot is applied and replays the buffered post-subscription incrementals.
+            eventQueue = new BlockingCollection<MarketEvent>(10000);
+            workerCts = new CancellationTokenSource();
+
+            symbol.NewLast += OnNewLast;
+            symbol.NewLevel2 += OnNewLevel2;
+            initialized = true; // gates callbacks — must be set before subscription is active
+
             SeedBookSnapshot();
             PublishSnapshot();
 
-            eventQueue = new BlockingCollection<MarketEvent>(10000);
-            workerCts = new CancellationTokenSource();
+            // Worker starts after the snapshot baseline is established; it will drain any
+            // events that buffered during the seed in correct sequence.
             workerThread = new Thread(ProcessQueueLoop)
             {
                 IsBackground = true,
@@ -125,11 +136,6 @@ namespace MBO_Market_Data_Analytics
                 Priority = ThreadPriority.AboveNormal
             };
             workerThread.Start();
-
-            symbol.NewLast += OnNewLast;
-            symbol.NewLevel2 += OnNewLevel2;
-
-            initialized = true;
         }
 
         public void Stop()
@@ -268,6 +274,8 @@ namespace MBO_Market_Data_Analytics
                     {
                         DateTime seedTime = DateTime.UtcNow;
                         int bc = 0, ac = 0;
+                        int totalItems = (snap.Bids != null ? snap.Bids.Length : 0) + (snap.Asks != null ? snap.Asks.Length : 0);
+
                         if (snap.Bids != null)
                             foreach (var b in snap.Bids)
                                 if (b?.Id != null)
@@ -284,9 +292,22 @@ namespace MBO_Market_Data_Analytics
                                     mboBook?.ApplySnapshot(seedTime, a.Id, false, a.Price, a.Size, a.Priority, a.NumberOrders);
                                     ac++;
                                 }
-                        isBookValid = true;
-                        log($"MBO book seeded: {bc} bid orders, {ac} ask orders tracked.", LoggingLevel.System);
-                        return;
+
+                        // C-04: if the snapshot contained items but none had real order IDs,
+                        // the feed is delivering MBP-aggregated data labelled as MBO. Downgrade.
+                        if (totalItems > 0 && bc + ac == 0)
+                        {
+                            log("MBO snapshot contained no real order IDs — feed appears MBP-aggregated. Downgrading to MBP mode.", LoggingLevel.System);
+                            Calculator.MboMode = false;
+                            mboBook = null;
+                            // fall through to MBP path below
+                        }
+                        else
+                        {
+                            isBookValid = true;
+                            log($"MBO book seeded: {bc} bid orders, {ac} ask orders tracked.", LoggingLevel.System);
+                            return;
+                        }
                     }
                 }
 
@@ -438,6 +459,28 @@ namespace MBO_Market_Data_Analytics
                 {
                     isBookValid = true;
                     log("L2 book bootstrapped from live stream (both sides now present).", LoggingLevel.System);
+                }
+
+                // C-04: verify MBO real-ID coverage after the first 100 live BookLevel events.
+                // If fewer than half carry real order IDs the feed is aggregated (MBP-shaped),
+                // so synthetic keys would dominate and Exact-quality labels would be false.
+                if (Calculator.MboMode && mboBook != null)
+                {
+                    int totalSeen = mboBook.RealIdEvents + mboBook.SyntheticIdEvents;
+                    if (totalSeen == 100)
+                    {
+                        double coverage = mboBook.RealIdCoverage;
+                        if (coverage < 0.5)
+                        {
+                            log($"MBO real-ID coverage too low ({coverage:P0} over first {totalSeen} events) — downgrading to MBP mode.", LoggingLevel.System);
+                            Calculator.MboMode = false;
+                            mboBook = null;
+                        }
+                        else
+                        {
+                            log($"MBO capability confirmed: {coverage:P0} real-ID coverage over first {totalSeen} events.", LoggingLevel.System);
+                        }
+                    }
                 }
             }
 

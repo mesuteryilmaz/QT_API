@@ -158,6 +158,11 @@ namespace MBO_Market_Data_Analytics
         // Dynamic Aggressor Flag Quality Metrics
         private double totalTradesWithAggressor = 0;
 
+        // H-07: first-event timestamps for window warm-up tracking.
+        // A window is only "warm" once its full duration has elapsed since the first event.
+        private DateTime? firstTradeTime = null;
+        private DateTime? firstL2Time = null;
+
         // Incremental sliding-window aggregators (replace the old LINQ-scanned queues)
         private readonly TradeWindowAggregator tradeAgg = new TradeWindowAggregator();
         private readonly L2WindowAggregator l2Agg = new L2WindowAggregator();
@@ -263,6 +268,7 @@ namespace MBO_Market_Data_Analytics
 
                 // Track aggressor coverage quality
                 totalTradesCount++;
+                firstTradeTime ??= time;
                 bool isBuy = aggressor == AggressorFlag.Buy;
                 bool isSell = aggressor == AggressorFlag.Sell;
                 if (isBuy || isSell)
@@ -687,6 +693,9 @@ namespace MBO_Market_Data_Analytics
             totalBuyerTradeQty = 0;
             totalSellerTradeQty = 0;
             totalTradesCount = 0;
+            totalTradesWithAggressor = 0;  // H-10: missing here caused coverage to exceed 100% after rollover
+            firstTradeTime = null;          // H-07: reset warm-up clock on session rollover
+            firstL2Time = null;             // H-07
 
             totalArrivedOrderCount = 0;
             totalArrivedOrderQty = 0;
@@ -842,6 +851,7 @@ namespace MBO_Market_Data_Analytics
         private void RecordL2Addition(DateTime time, double price, double size, bool isBid, string? orderId = null)
         {
             l2Agg.AddAddition(time.Ticks, size, isBid);
+            firstL2Time ??= time;
             totalArrivedOrderCount++;
             totalArrivedOrderQty += size;
 
@@ -993,8 +1003,19 @@ namespace MBO_Market_Data_Analytics
             return new MetricValue(value, quality, eventTimeNs, receiveTicks, isWarm);
         }
 
-        private bool IsTradeWarm(int seconds) => IsCalibrated && tradeAgg.TotalCount(WindowForSeconds(seconds)) > 0;
-        private bool IsL2Warm() => IsCalibrated && (l2Agg.AddCount(TradeWindows.L2Short) + l2Agg.CancelCount(TradeWindows.L2Short)) > 0;
+        private bool IsTradeWarm(int seconds)
+        {
+            if (!IsCalibrated || !firstTradeTime.HasValue) return false;
+            if (tradeAgg.TotalCount(WindowForSeconds(seconds)) == 0) return false;
+            return (new DateTime(currentTicks, DateTimeKind.Utc) - firstTradeTime.Value).TotalSeconds >= seconds;
+        }
+
+        private bool IsL2Warm()
+        {
+            if (!IsCalibrated || !firstL2Time.HasValue) return false;
+            if (l2Agg.AddCount(TradeWindows.L2Short) + l2Agg.CancelCount(TradeWindows.L2Short) == 0) return false;
+            return (new DateTime(currentTicks, DateTimeKind.Utc) - firstL2Time.Value).TotalSeconds >= 60;
+        }
 
         private MetricQuality GetTradeQuality()
         {

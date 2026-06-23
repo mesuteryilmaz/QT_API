@@ -255,7 +255,8 @@ namespace MBO_Market_Data_Analytics
                 OnEventProcessed = EvaluateTradingSignal,
                 OnSessionRollover = OnSessionRollover
             };
-            engine.Start();
+            // H-01: engine.Start() deferred to after all dependent state (adaptive controller,
+            // shadow sim, connection flags, and broker reconciliation) is fully initialized.
 
             // Phase 1: build the self-tuning parameter controller and seed its ATR from history.
             if (InputParameterMode == StrategyParameterMode.Adaptive)
@@ -312,12 +313,53 @@ namespace MBO_Market_Data_Analytics
                 isExecutionConnectionActive = execConn.State == ConnectionState.Connected;
             }
 
-            // Perform initial reconciliation
+            // Perform initial reconciliation before any market events can trigger signal evaluation.
             ReconcileBrokerState();
+
+            // H-01: start the engine only after all state is ready — adaptive controller, shadow sim,
+            // connection flags, and broker position are all set. The worker's OnEventProcessed callback
+            // (EvaluateTradingSignal) cannot fire until Start() is called.
+            engine.Start();
         }
 
         protected override void OnStop()
         {
+            // H-24: Cancel all working broker orders and flatten any open position before teardown.
+            // Done synchronously here (not via prioritizedQueue) so it executes even if the queue
+            // is already draining or not yet processing.
+            foreach (var kv in trackedOrders)
+            {
+                var state = kv.Value;
+                if (state.OrderInstance != null &&
+                    (state.Status == OrderStatus.Opened || state.Status == OrderStatus.PartiallyFilled))
+                {
+                    try { state.OrderInstance.Cancel(); }
+                    catch (Exception ex) { Log($"[OnStop] Order cancel failed: {ex.Message}", StrategyLoggingLevel.Error); }
+                }
+            }
+            double stopPosSize = GetBrokerPositionSize();
+            if (stopPosSize != 0.0 && CurrentSymbol != null && CurrentAccount != null)
+            {
+                Log($"[OnStop] Flattening open position ({stopPosSize:+0.##;-0.##} contracts) on strategy stop.", StrategyLoggingLevel.Error);
+                Side flatSide = stopPosSize > 0.0 ? Side.Sell : Side.Buy;
+                var mktType = CurrentSymbol.GetAlowedOrderTypes(OrderTypeUsage.Order)
+                                 .FirstOrDefault(ot => ot.Behavior == OrderTypeBehavior.Market) ??
+                             CurrentSymbol.GetAlowedOrderTypes(OrderTypeUsage.All)
+                                 .FirstOrDefault(ot => ot.Behavior == OrderTypeBehavior.Market);
+                try
+                {
+                    Core.Instance.PlaceOrder(new PlaceOrderRequestParameters
+                    {
+                        Symbol = CurrentSymbol,
+                        Account = CurrentAccount,
+                        Side = flatSide,
+                        OrderTypeId = mktType?.Id ?? OrderType.Market,
+                        Quantity = Math.Abs(stopPosSize)
+                    });
+                }
+                catch (Exception ex) { Log($"[OnStop] Market flatten failed: {ex.Message}", StrategyLoggingLevel.Error); }
+            }
+
             // Unsubscribe from order/position events on Core
             Core.OrderAdded -= OnCoreOrderAdded;
             Core.OrderRemoved -= OnCoreOrderRemoved;

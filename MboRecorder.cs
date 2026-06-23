@@ -62,10 +62,12 @@ namespace MBO_Market_Data_Analytics
 
         public void Stop()
         {
+            // H-23: CompleteAdding() signals the writer to drain then exit via InvalidOperationException.
+            // Cancel only after Join so queued events are not lost; if Join times out the cancel forces exit.
             try { queue.CompleteAdding(); } catch { }
-            cts?.Cancel();
             if (writer != null && writer.IsAlive)
-                writer.Join(2000);
+                writer.Join(5000);
+            cts?.Cancel();
         }
 
         private void WriteLoop()

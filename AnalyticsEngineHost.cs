@@ -633,6 +633,10 @@ namespace MBO_Market_Data_Analytics
                 DOMImbalance10 = calc.GetDOMImbalance10(),
                 QueueImbalance = calc.GetQueueImbalance(),
                 BookPressure = calc.GetBookPressure(),
+                BestBidOrderCount = calc.GetBestBidOrderCount(),
+                BestAskOrderCount = calc.GetBestAskOrderCount(),
+                BestBidAvgOrderSize = calc.GetBestBidAvgOrderSize(),
+                BestAskAvgOrderSize = calc.GetBestAskAvgOrderSize(),
 
                 AbsorptionBuy = calc.GetAbsorptionBuy(),
                 AbsorptionSell = calc.GetAbsorptionSell(),

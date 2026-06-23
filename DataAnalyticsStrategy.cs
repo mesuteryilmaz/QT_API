@@ -550,13 +550,16 @@ namespace MBO_Market_Data_Analytics
 
                 bool isWithinCooldown = (now - lastOrderPlacementTime) < TimeSpan.FromSeconds(InputCooldownSeconds);
 
+                int bestBidOrders = (int)(calc.GetBestBidOrderCount().Value);
+                int bestAskOrders = (int)(calc.GetBestAskOrderCount().Value);
+
                 // Buy signal
                 if (ratio >= buyTh)
                 {
                     if (!buySignalActive)
                     {
                         buySignalActive = true;
-                        EnterSignal(Side.Buy, wantLive, effTp, effSl, bid, ask, now, isWithinCooldown);
+                        EnterSignal(Side.Buy, wantLive, effTp, effSl, bid, ask, now, isWithinCooldown, bestAskOrders);
                     }
                 }
                 else if (ratio <= buyReset) buySignalActive = false;
@@ -567,7 +570,7 @@ namespace MBO_Market_Data_Analytics
                     if (!sellSignalActive)
                     {
                         sellSignalActive = true;
-                        EnterSignal(Side.Sell, wantLive, effTp, effSl, bid, ask, now, isWithinCooldown);
+                        EnterSignal(Side.Sell, wantLive, effTp, effSl, bid, ask, now, isWithinCooldown, bestBidOrders);
                     }
                 }
                 else if (ratio >= sellReset) sellSignalActive = false;
@@ -576,7 +579,7 @@ namespace MBO_Market_Data_Analytics
 
         // Routes a newly-activated signal to the live broker path or the paper simulator.
         // Called under stateLock.
-        private void EnterSignal(Side side, bool wantLive, int tpTicks, int slTicks, double bid, double ask, DateTime now, bool isWithinCooldown)
+        private void EnterSignal(Side side, bool wantLive, int tpTicks, int slTicks, double bid, double ask, DateTime now, bool isWithinCooldown, int bestOrderCount = 0)
         {
             if (wantLive)
             {
@@ -595,7 +598,7 @@ namespace MBO_Market_Data_Analytics
             {
                 if (shadowSim != null && shadowSim.CanEnter(now) && (tpTicks > 0 || slTicks > 0))
                 {
-                    if (shadowSim.Enter(side, bid, ask, tpTicks, slTicks, now))
+                    if (shadowSim.Enter(side, bid, ask, tpTicks, slTicks, now, bestOrderCount))
                         Log($"[Shadow] Paper {side} entered (TP {tpTicks} / SL {slTicks} ticks).", StrategyLoggingLevel.Trading);
                 }
             }

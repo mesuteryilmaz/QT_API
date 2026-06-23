@@ -167,6 +167,10 @@ namespace MBO_Market_Data_Analytics
         public MetricValue DOMImbalance10 { get; init; }
         public MetricValue QueueImbalance { get; init; }
         public MetricValue BookPressure { get; init; }
+        public MetricValue BestBidOrderCount { get; init; }
+        public MetricValue BestAskOrderCount { get; init; }
+        public MetricValue BestBidAvgOrderSize { get; init; }
+        public MetricValue BestAskAvgOrderSize { get; init; }
 
         // Category 7: Microstructure Signals
         public MetricValue AbsorptionBuy { get; init; }
@@ -423,6 +427,12 @@ namespace MBO_Market_Data_Analytics
                 drawY2 += rowHeight;
 
                 DrawMetricValueRow(g, "Order Book Pressure", snapshot.BookPressure, "F1", fontLabel, fontValue, textSecondary, textPrimary, col2X, drawY2, colWidth);
+                drawY2 += rowHeight;
+
+                DrawMetricValueRow(g, "Best Bid Orders / Avg Sz", snapshot.BestBidOrderCount, "F0", fontLabel, fontValue, textSecondary, textPrimary, col2X, drawY2, colWidth);
+                drawY2 += rowHeight;
+
+                DrawMetricValueRow(g, "Best Ask Orders / Avg Sz", snapshot.BestAskOrderCount, "F0", fontLabel, fontValue, textSecondary, textPrimary, col2X, drawY2, colWidth);
                 drawY2 += rowHeight;
 
                 drawY2 += 7; // Separator

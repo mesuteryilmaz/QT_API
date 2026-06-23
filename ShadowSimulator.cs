@@ -147,18 +147,24 @@ namespace MBO_Market_Data_Analytics
         public bool CanEnter(DateTime now)
             => pos == 0 && (now - lastExit).TotalSeconds >= cfg.CooldownSeconds;
 
-        /// <summary>Enters a paper position at the far touch (+slippage). Returns false if not flat.</summary>
-        public bool Enter(Side side, double bid, double ask, int tpTicks, int slTicks, DateTime now)
+        /// <summary>
+        /// Enters a paper position. When bestOrderCount ≤ 2 (thin queue), fills at mid rather than far touch.
+        /// Returns false if not flat.
+        /// </summary>
+        public bool Enter(Side side, double bid, double ask, int tpTicks, int slTicks, DateTime now, int bestOrderCount = 0)
         {
             if (pos != 0) return false;
 
             double ts = cfg.TickSize > 0 ? cfg.TickSize : 1.0;
             double slip = cfg.SlippageTicks * ts;
+            bool thinQueue = bestOrderCount > 0 && bestOrderCount <= 2;
+            double mid = (bid + ask) / 2.0;
 
             if (side == Side.Buy)
             {
-                double fill = ask > 0 ? ask : bid;
-                if (fill <= 0) return false;
+                double farTouch = ask > 0 ? ask : bid;
+                if (farTouch <= 0) return false;
+                double fill = thinQueue ? mid : farTouch;
                 pos = +1;
                 entry = fill + slip;
                 tp = tpTicks > 0 ? entry + tpTicks * ts : double.PositiveInfinity;
@@ -166,8 +172,9 @@ namespace MBO_Market_Data_Analytics
             }
             else
             {
-                double fill = bid > 0 ? bid : ask;
-                if (fill <= 0) return false;
+                double farTouch = bid > 0 ? bid : ask;
+                if (farTouch <= 0) return false;
+                double fill = thinQueue ? mid : farTouch;
                 pos = -1;
                 entry = fill - slip;
                 tp = tpTicks > 0 ? entry - tpTicks * ts : double.NegativeInfinity;

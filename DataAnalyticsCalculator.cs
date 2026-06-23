@@ -183,6 +183,13 @@ namespace MBO_Market_Data_Analytics
         // the order was added. Enables exact add→cancel matching without a price+time heuristic.
         private readonly Dictionary<string, L2AdditionTracker> mboAddByOrderId = new Dictionary<string, L2AdditionTracker>();
 
+        // Per-price order counts (MBO mode only). Maintained in parallel with bidBook/askBook so that
+        // the number of distinct orders at the best bid/ask can be read in O(1).
+        private readonly Dictionary<long, int> bidCountBook = new Dictionary<long, int>();
+        private readonly Dictionary<long, int> askCountBook = new Dictionary<long, int>();
+        private int bestBidOrderCount;
+        private int bestAskOrderCount;
+
         // Incremental best bid/ask (maintained in both modes; used by microprice + OFI).
         private bool hasBestBid, hasBestAsk;
         private long bestBidTicks, bestAskTicks;
@@ -419,6 +426,7 @@ namespace MBO_Market_Data_Analytics
                         double nt = ApplyPriceLevelDelta(isBid, tick, evt.Size);
                         mboOrders[orderId] = new MboLevelRef { Ticks = tick, Size = evt.Size, IsBid = isBid };
                         UpdateBest(isBid, tick, nt);
+                        CountBookInc(isBid, tick);
                         RecordL2Addition(evt.Time, evt.Price, evt.Size, isBid, orderId);
                         break;
                     }
@@ -443,10 +451,12 @@ namespace MBO_Market_Data_Analytics
                                 // Order moved price or side: remove from old level, add at new
                                 double oldTotal = ApplyPriceLevelDelta(existing.IsBid, existing.Ticks, -existing.Size);
                                 UpdateBest(existing.IsBid, existing.Ticks, oldTotal);
+                                CountBookDec(existing.IsBid, existing.Ticks);
                                 HandleL2Reduction(evt.Time, existing.Ticks * ts, existing.Size, existing.IsBid, orderId);
                                 double newTotal = ApplyPriceLevelDelta(isBid, tick, evt.Size);
                                 existing.Ticks = tick; existing.Size = evt.Size; existing.IsBid = isBid;
                                 UpdateBest(isBid, tick, newTotal);
+                                CountBookInc(isBid, tick);
                                 RecordL2Addition(evt.Time, evt.Price, evt.Size, isBid, orderId);
                             }
                         }
@@ -456,6 +466,7 @@ namespace MBO_Market_Data_Analytics
                             double nt = ApplyPriceLevelDelta(isBid, tick, evt.Size);
                             mboOrders[orderId] = new MboLevelRef { Ticks = tick, Size = evt.Size, IsBid = isBid };
                             UpdateBest(isBid, tick, nt);
+                            CountBookInc(isBid, tick);
                             RecordL2Addition(evt.Time, evt.Price, evt.Size, isBid, orderId);
                         }
                         break;
@@ -467,12 +478,14 @@ namespace MBO_Market_Data_Analytics
                             double nt = ApplyPriceLevelDelta(o.IsBid, o.Ticks, -o.Size);
                             mboOrders.Remove(orderId);
                             UpdateBest(o.IsBid, o.Ticks, nt);
+                            CountBookDec(o.IsBid, o.Ticks);
                             HandleL2Reduction(evt.Time, o.Ticks * ts, o.Size, o.IsBid, orderId);
                         }
                         break;
                     }
                 }
 
+                RefreshBestCounts();
                 AccumulateOfi(pHasBid, pBidT, pBidSz, pHasAsk, pAskT, pAskSz);
                 PruneUnmatchedTrades(evt.Time);
                 PruneMicrostructureCollections(evt.Time);
@@ -514,6 +527,9 @@ namespace MBO_Market_Data_Analytics
                 double nt = ApplyPriceLevelDelta(isBid, tick, size);
                 mboOrders[id] = new MboLevelRef { Ticks = tick, Size = size, IsBid = isBid };
                 UpdateBest(isBid, tick, nt);
+                var cBook = isBid ? bidCountBook : askCountBook;
+                cBook[tick] = (cBook.TryGetValue(tick, out int cx) ? cx : 0) + 1;
+                RefreshBestCounts();
             }
         }
 
@@ -628,11 +644,37 @@ namespace MBO_Market_Data_Analytics
         {
             mboOrders.Clear();
             mboAddByOrderId.Clear();
+            bidCountBook.Clear();
+            askCountBook.Clear();
+            bestBidOrderCount = 0;
+            bestAskOrderCount = 0;
             hasBestBid = hasBestAsk = false;
             bestBidTicks = bestAskTicks = 0;
             bestBidSize = bestAskSize = 0;
             ofiWindow.Clear();
             ofiSum = 0;
+        }
+
+        private void CountBookInc(bool isBid, long tick)
+        {
+            var book = isBid ? bidCountBook : askCountBook;
+            book[tick] = (book.TryGetValue(tick, out int c) ? c : 0) + 1;
+        }
+
+        private void CountBookDec(bool isBid, long tick)
+        {
+            var book = isBid ? bidCountBook : askCountBook;
+            if (book.TryGetValue(tick, out int c))
+            {
+                if (c <= 1) book.Remove(tick);
+                else book[tick] = c - 1;
+            }
+        }
+
+        private void RefreshBestCounts()
+        {
+            bestBidOrderCount = hasBestBid && bidCountBook.TryGetValue(bestBidTicks, out var bc) ? bc : 0;
+            bestAskOrderCount = hasBestAsk && askCountBook.TryGetValue(bestAskTicks, out var ac) ? ac : 0;
         }
 
         private void ClearSessionAccumulators()
@@ -1163,6 +1205,21 @@ private MetricValue CalculateImbalance(int levels)
 
         public MetricValue GetAbsorptionBuy() => CalculateAbsorption(true);
         public MetricValue GetAbsorptionSell() => CalculateAbsorption(false);
+
+        public MetricValue GetBestBidOrderCount() =>
+            CreateMetric(bestBidOrderCount, MboMode ? MetricQuality.Exact : MetricQuality.Unavailable, hasBestBid);
+        public MetricValue GetBestAskOrderCount() =>
+            CreateMetric(bestAskOrderCount, MboMode ? MetricQuality.Exact : MetricQuality.Unavailable, hasBestAsk);
+        public MetricValue GetBestBidAvgOrderSize()
+        {
+            double avg = bestBidOrderCount > 0 ? bestBidSize / bestBidOrderCount : 0;
+            return CreateMetric(avg, MboMode ? MetricQuality.Exact : MetricQuality.Unavailable, hasBestBid && bestBidOrderCount > 0);
+        }
+        public MetricValue GetBestAskAvgOrderSize()
+        {
+            double avg = bestAskOrderCount > 0 ? bestAskSize / bestAskOrderCount : 0;
+            return CreateMetric(avg, MboMode ? MetricQuality.Exact : MetricQuality.Unavailable, hasBestAsk && bestAskOrderCount > 0);
+        }
 
         private MetricValue CalculateAbsorption(bool isBuy)
         {

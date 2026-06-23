@@ -983,15 +983,33 @@ namespace MBO_Market_Data_Analytics
                 {
                     double filledDiff = newFilled - oldFilled;
                     Log($"[Fill Alert] Order {ord.Id} filled: {oldFilled} -> {newFilled} (Diff: {filledDiff})", StrategyLoggingLevel.Trading);
-                    
-                    ProcessExecutionFill(ord.Side, ord.AverageFillPrice > 0 ? ord.AverageFillPrice : ord.Price, filledDiff);
 
-                    // Only our own signal entries spawn protective brackets. Bracket fills and
-                    // reconciled (post-reconnect, role-unknown) orders must NOT spawn new brackets,
-                    // otherwise a TP/SL fill after a reconnect would cascade into fresh orders.
-                    if (state.Role == OrderRole.Entry)
+                    // OCO guard: if a bracket (SL or TP) fills after the position is already flat,
+                    // the sibling bracket closed it first. Processing this fill would open a new
+                    // position in the opposite direction. Reject it and cancel the order.
+                    bool rejectFill = false;
+                    if (state.Role == OrderRole.Bracket)
                     {
-                        ManageBracketsForFill(ord.Side, ord.AverageFillPrice > 0 ? ord.AverageFillPrice : ord.Price, filledDiff);
+                        lock (stateLock) { rejectFill = currentPositionSize == 0.0; }
+                        if (rejectFill)
+                        {
+                            Log($"[OCO Guard] Bracket {ord.Id} filled after position was already flat — rejecting to prevent reversal.", StrategyLoggingLevel.Error);
+                            var ordRefOco = ord;
+                            prioritizedQueue?.Enqueue(() => { ordRefOco.Cancel(); return Task.CompletedTask; }, 0);
+                        }
+                    }
+
+                    if (!rejectFill)
+                    {
+                        ProcessExecutionFill(ord.Side, ord.AverageFillPrice > 0 ? ord.AverageFillPrice : ord.Price, filledDiff);
+
+                        // Only our own signal entries spawn protective brackets. Bracket fills and
+                        // reconciled (post-reconnect, role-unknown) orders must NOT spawn new brackets,
+                        // otherwise a TP/SL fill after a reconnect would cascade into fresh orders.
+                        if (state.Role == OrderRole.Entry)
+                        {
+                            ManageBracketsForFill(ord.Side, ord.AverageFillPrice > 0 ? ord.AverageFillPrice : ord.Price, filledDiff);
+                        }
                     }
                 }
 
@@ -1133,14 +1151,12 @@ namespace MBO_Market_Data_Analytics
                         }
                         else
                         {
-                            Log($"[Bracket SL] Placement failed: {slResult.Message}", StrategyLoggingLevel.Error);
-                            consecutiveOrderFailures++;
-                            if (consecutiveOrderFailures >= MaxConsecutiveFailures)
-                            {
-                                isRiskHalted = true;
-                                Log($"[Risk Limit] Strategy halted due to bracket SL placement failure.", StrategyLoggingLevel.Error);
-                                FlattenPosition();
-                            }
+                            // A missing SL means the position has no downside protection.
+                            // Flatten immediately regardless of consecutive-failure count.
+                            isRiskHalted = true;
+                            Log($"[Risk Limit] SL placement failed: {slResult.Message}. Flattening — open position has no stop loss.", StrategyLoggingLevel.Error);
+                            FlattenPosition();
+                            return Task.CompletedTask; // skip TP placement — no point protecting upside without a stop
                         }
                     }
                 }

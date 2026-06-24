@@ -27,5 +27,11 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\DataAnalytics.csproj" />
+    <!-- Copied locally (Private=True) so the test exe can load the platform enums (Side,
+         OrderStatus) the fakes use. We never touch Core.Instance, so no host init occurs. -->
+    <Reference Include="TradingPlatform.BusinessLayer">
+      <HintPath>C:\Quantower\TradingPlatform\v1.146.13\bin\TradingPlatform.BusinessLayer.dll</HintPath>
+      <Private>True</Private>
+    </Reference>
   </ItemGroup>
 </Project>

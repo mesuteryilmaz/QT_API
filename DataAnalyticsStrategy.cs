@@ -131,6 +131,12 @@ namespace MBO_Market_Data_Analytics
         [InputParameter("Thin Queue Stand-Aside (MBO orders, 0=off)", 33, minimum: 0, maximum: 20, increment: 1, decimalPlaces: 0)]
         public int InputThinQueueThreshold = 2;
 
+        // C-09: when true, the strategy refuses to route LIVE if foreign/manual working orders are
+        // present on the same symbol+account, since it cannot safely isolate its own exposure from
+        // theirs. It still runs in shadow. Set false only on a dedicated account.
+        [InputParameter("Require Dedicated Account (block live on foreign orders)", 34)]
+        public bool RequireDedicatedAccount = true;
+
         private AnalyticsEngineHost? engine;
 
         // Phase 1 adaptive controller (null in Static mode)
@@ -180,8 +186,15 @@ namespace MBO_Market_Data_Analytics
         private DateTime lastStatusLogTime = DateTime.MinValue;
 
         // Order comment tags used to recover an order's role after a restart or reconnect.
+        // C-09: placed-order comments take the form "TAG|runId" so this instance can tell its own
+        // orders (and run) apart from foreign/manual orders and other strategy instances.
         private const string EntryTag = "MBO:ENTRY";
         private const string BracketTag = "MBO:BRK";
+
+        // C-09 ownership state. runId is generated per OnRun and embedded in every placed order's
+        // comment. foreignExposureDetected latches true when unmanaged working orders are present.
+        private string runId = "";
+        private volatile bool foreignExposureDetected = false;
 
         private static OrderRole RoleFromComment(string? comment)
         {
@@ -192,6 +205,16 @@ namespace MBO_Market_Data_Analytics
             }
             return OrderRole.Reconciled;
         }
+
+        // C-09: a "managed" comment is one this strategy family placed (carries our entry/bracket
+        // tag). Foreign/manual orders carry neither and must never be tracked, cancelled, or counted.
+        private static bool IsManagedComment(string? comment) => RoleFromComment(comment) != OrderRole.Reconciled;
+
+        // C-09: builds the per-run order comment. Until the persisted-runId reconciliation step lands,
+        // a restart gets a fresh runId; orders from a prior run still carry our family tag and remain
+        // manageable (RoleFromComment), but are not attributed to THIS run.
+        private string EntryComment() => $"{EntryTag}|{runId}";
+        private string BracketComment() => $"{BracketTag}|{runId}";
 
         public override string[] MonitoringConnectionsIds => new[]
         {
@@ -225,6 +248,12 @@ namespace MBO_Market_Data_Analytics
             averageEntryPrice = 0.0;
             currentPositionSize = 0.0;
             trackedOrders.Clear();
+
+            // C-09: stamp this run. Every order placed below carries "TAG|runId" so the strategy
+            // manages only its own orders and can be told apart from other instances / manual trades.
+            runId = Guid.NewGuid().ToString("N").Substring(0, 12);
+            foreignExposureDetected = false;
+            Log($"[Ownership] Run id {runId}. Managing only orders tagged by this strategy; foreign orders are observed but never controlled.", StrategyLoggingLevel.Info);
             buySignalActive = false;
             sellSignalActive = false;
             lastOrderPlacementTime = DateTime.MinValue;
@@ -779,6 +808,11 @@ namespace MBO_Market_Data_Analytics
 
         private bool ResolveWantLive()
         {
+            // C-09: never route live while foreign/manual orders share the account (unless the
+            // operator has explicitly opted out via RequireDedicatedAccount=false).
+            if (foreignExposureDetected && RequireDedicatedAccount)
+                return false;
+
             switch (InputExecutionMode)
             {
                 case ExecutionMode.LiveOnly: return true;
@@ -864,7 +898,7 @@ namespace MBO_Market_Data_Analytics
                     OrderTypeId = orderTypeId,
                     Price = price,
                     Quantity = qty,
-                    Comment = EntryTag
+                    Comment = EntryComment()
                 };
                 
                 try
@@ -990,7 +1024,16 @@ namespace MBO_Market_Data_Analytics
                 }
                 else
                 {
-                    // Tracked order placed outside this running instance or during disconnection
+                    // C-09: only adopt orders this strategy placed (carry our tag). Foreign/manual
+                    // orders on the same symbol+account are observed but never tracked — so they can
+                    // never be cancelled/flattened by us, and their fills never move our position.
+                    if (!IsManagedComment(order.Comment))
+                    {
+                        Log($"[Foreign Order] Ignoring unmanaged order {order.Id} ({order.Side} {order.TotalQuantity} @ {order.Price}). Not controlled by this strategy.", StrategyLoggingLevel.Info);
+                        return;
+                    }
+
+                    // Our own order, first seen here (placed during a disconnect, or by a prior run).
                     var newState = new TrackedOrderState
                     {
                         LocalId = Guid.NewGuid().ToString(),
@@ -1001,11 +1044,11 @@ namespace MBO_Market_Data_Analytics
                         FilledQuantity = order.FilledQuantity,
                         Status = order.Status,
                         OrderInstance = order,
-                        Role = RoleFromComment(order.Comment) // Recover our own role from the tag; foreign orders stay Reconciled
+                        Role = RoleFromComment(order.Comment)
                     };
                     trackedOrders[order.Id] = newState;
                     order.Updated += OnOrderUpdated;
-                    Log($"[Reconciled Order] Tracking working order: {order.Id} ({order.Side} {order.TotalQuantity} @ {order.Price}), role {newState.Role}.", StrategyLoggingLevel.Info);
+                    Log($"[Reconciled Order] Tracking own working order: {order.Id} ({order.Side} {order.TotalQuantity} @ {order.Price}), role {newState.Role}.", StrategyLoggingLevel.Info);
                 }
             }
         }
@@ -1212,7 +1255,7 @@ namespace MBO_Market_Data_Analytics
                             OrderTypeId = stopOrderType.Id,
                             TriggerPrice = slPrice,
                             Quantity = qty,
-                            Comment = BracketTag
+                            Comment = BracketComment()
                         });
 
                         if (slResult.Status == TradingOperationResultStatus.Success)
@@ -1264,7 +1307,7 @@ namespace MBO_Market_Data_Analytics
                         OrderTypeId = limitTypeId,
                         Price = tpPrice,
                         Quantity = qty,
-                        Comment = BracketTag
+                        Comment = BracketComment()
                     });
 
                     if (tpResult.Status == TradingOperationResultStatus.Success)
@@ -1448,16 +1491,21 @@ namespace MBO_Market_Data_Analytics
                 }
             }
 
-            // 2. Reconcile Orders
-            var activeOrders = Core.Instance.Orders.Where(o => o.Symbol?.Id == CurrentSymbol.Id && o.Account?.Id == CurrentAccount.Id && 
+            // 2. Reconcile Orders — only our own (tagged) orders are managed. C-09: foreign/manual
+            // working orders on the same symbol+account are counted for the dedicated-account gate
+            // but never tracked, linked, cancelled, or flattened by this strategy.
+            var workingOrders = Core.Instance.Orders.Where(o => o.Symbol?.Id == CurrentSymbol.Id && o.Account?.Id == CurrentAccount.Id &&
                                                               (o.Status == OrderStatus.Opened || o.Status == OrderStatus.PartiallyFilled)).ToList();
 
-            var brokerOrderIds = new HashSet<string>(activeOrders.Select(o => o.Id));
+            var managedOrders = workingOrders.Where(o => IsManagedComment(o.Comment)).ToList();
+            int foreignCount = workingOrders.Count - managedOrders.Count;
 
-            // Clear tracked orders that are no longer working
+            var managedOrderIds = new HashSet<string>(managedOrders.Select(o => o.Id));
+
+            // Clear tracked orders that are no longer working (compare against our managed set only).
             foreach (var orderId in trackedOrders.Keys.ToList())
             {
-                if (!brokerOrderIds.Contains(orderId))
+                if (!managedOrderIds.Contains(orderId))
                 {
                     if (trackedOrders.TryRemove(orderId, out var state))
                     {
@@ -1470,8 +1518,8 @@ namespace MBO_Market_Data_Analytics
                 }
             }
 
-            // Link existing active orders
-            foreach (var ord in activeOrders)
+            // Link existing managed (own) working orders.
+            foreach (var ord in managedOrders)
             {
                 if (!trackedOrders.TryGetValue(ord.Id, out var state))
                 {
@@ -1485,11 +1533,11 @@ namespace MBO_Market_Data_Analytics
                         FilledQuantity = ord.FilledQuantity,
                         Status = ord.Status,
                         OrderInstance = ord,
-                        Role = RoleFromComment(ord.Comment) // Recover our own role from the tag; foreign orders stay Reconciled
+                        Role = RoleFromComment(ord.Comment)
                     };
                     trackedOrders[ord.Id] = newState;
                     ord.Updated += OnOrderUpdated;
-                    Log($"[Reconciliation] Linked working order: {ord.Id}, role {newState.Role}.", StrategyLoggingLevel.Info);
+                    Log($"[Reconciliation] Linked own working order: {ord.Id}, role {newState.Role}.", StrategyLoggingLevel.Info);
                 }
                 else
                 {
@@ -1497,6 +1545,20 @@ namespace MBO_Market_Data_Analytics
                     ord.Updated -= OnOrderUpdated;
                     ord.Updated += OnOrderUpdated;
                 }
+            }
+
+            // C-09 dedicated-account gate: foreign working orders block LIVE routing (shadow continues).
+            if (foreignCount > 0)
+            {
+                if (!foreignExposureDetected)
+                    Log($"[Ownership] {foreignCount} foreign/manual working order(s) detected on {CurrentSymbol.Name}/{CurrentAccount.Name}. " +
+                        (RequireDedicatedAccount ? "LIVE routing blocked (shadow continues). Disable 'Require Dedicated Account' only on a dedicated account."
+                                                 : "Proceeding (Require Dedicated Account is OFF)."), StrategyLoggingLevel.Error);
+                foreignExposureDetected = true;
+            }
+            else
+            {
+                foreignExposureDetected = false;
             }
         }
     }

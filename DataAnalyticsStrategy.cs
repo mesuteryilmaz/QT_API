@@ -143,6 +143,10 @@ namespace MBO_Market_Data_Analytics
         // queries route through this so the execution logic can be driven by a fake broker in tests.
         private IBroker? broker;
 
+        // Scheduler seam over the prioritized async queue (so execution work can run synchronously
+        // and deterministically under test).
+        private IExecScheduler? scheduler;
+
         // Phase 1 adaptive controller (null in Static mode)
         private AdaptiveParameterController? adaptiveController;
         // Phase 2: last known polarity — used to detect transitions and reset signal state
@@ -279,8 +283,9 @@ namespace MBO_Market_Data_Analytics
             adaptiveReadyLogged = false;
             lastStatusLogTime = DateTime.MinValue;
 
-            // Initialize prioritized order execution queue
+            // Initialize prioritized order execution queue + its scheduler seam.
             prioritizedQueue = new PrioritizedAsyncTaskQueue();
+            scheduler = new QueueScheduler(prioritizedQueue);
 
             // Build and start the shared analytics engine (worker thread, auto-MTR calibration,
             // book seed, overflow recovery, session rollover). Trading signals are evaluated on the
@@ -384,13 +389,13 @@ namespace MBO_Market_Data_Analytics
             // entries, and bounded-join any in-flight task. This guarantees no queued flatten/close
             // can run concurrently with the synchronous teardown flatten below (no double close).
             TransitionTo(StrategyLifecycleState.Halting, "strategy stop");
-            prioritizedQueue?.StopAccepting();
-            prioritizedQueue?.CancelPendingEntries();
-            prioritizedQueue?.Shutdown();
+            scheduler?.StopAccepting();
+            scheduler?.CancelPendingEntries();
+            scheduler?.Shutdown();
 
             // H-24: Cancel all working broker orders and flatten any open position before teardown.
-            // Done synchronously here (not via prioritizedQueue, which is now stopped) so it executes
-            // deterministically against the final broker position.
+            // Done synchronously here (not via the scheduler/queue, which is now stopped) so it
+            // executes deterministically against the final broker position.
             foreach (var kv in trackedOrders)
             {
                 var state = kv.Value;
@@ -456,7 +461,7 @@ namespace MBO_Market_Data_Analytics
         private void OnSessionRollover()
         {
             // Flat open positions at CME session end
-            prioritizedQueue?.Enqueue(() =>
+            scheduler?.Post(() =>
             {
                 FlattenPosition("session rollover");
                 return Task.CompletedTask;
@@ -828,7 +833,7 @@ namespace MBO_Market_Data_Analytics
                     {
                         string? oid = oe.OrderId;
                         if (oid != null)
-                            prioritizedQueue?.Enqueue(() => { broker?.Cancel(oid); return Task.CompletedTask; }, 1, TaskCategory.Protection);
+                            scheduler?.Post(() => { broker?.Cancel(oid); return Task.CompletedTask; }, 1, TaskCategory.Protection);
                     }
                     Log($"[Entry Policy] Opposite-side working entry present; cancelling it before a {side} entry.", StrategyLoggingLevel.Trading);
                     // Reset this side's signal latch so the entry re-fires on the next qualifying tick,
@@ -931,7 +936,7 @@ namespace MBO_Market_Data_Analytics
             isOrderPlacementPending = true;
             lastOrderPlacementTime = DateTime.UtcNow;
 
-            prioritizedQueue?.Enqueue(() =>
+            scheduler?.Post(() =>
             {
                 try
                 {
@@ -990,7 +995,7 @@ namespace MBO_Market_Data_Analytics
         {
             isRiskHalted = true;
             TransitionTo(StrategyLifecycleState.Halting, reason);
-            int dropped = prioritizedQueue?.CancelPendingEntries() ?? 0;
+            int dropped = scheduler?.CancelPendingEntries() ?? 0;
             if (dropped > 0)
                 Log($"[Lifecycle] Cancelled {dropped} pending entry-placement task(s) on halt.", StrategyLoggingLevel.Info);
             FlattenPosition(reason);
@@ -1056,7 +1061,7 @@ namespace MBO_Market_Data_Analytics
                     (trackedOrder.Status == OrderStatus.Opened || trackedOrder.Status == OrderStatus.PartiallyFilled))
                 {
                     string oid = trackedOrder.OrderId;
-                    prioritizedQueue?.Enqueue(() =>
+                    scheduler?.Post(() =>
                     {
                         broker?.Cancel(oid);
                         return Task.CompletedTask;
@@ -1065,7 +1070,7 @@ namespace MBO_Market_Data_Analytics
             }
 
             // 2. Place market order to close open position (priority 1)
-            prioritizedQueue?.Enqueue(() =>
+            scheduler?.Post(() =>
             {
                 double posSize = GetBrokerPositionSize();
                 if (posSize == 0.0)
@@ -1305,7 +1310,7 @@ namespace MBO_Market_Data_Analytics
                     {
                         string oid = trackedOrder.OrderId;
                         Log($"[OCO Action] Position flat. Cancelling bracket order {oid}.", StrategyLoggingLevel.Trading);
-                        prioritizedQueue?.Enqueue(() =>
+                        scheduler?.Post(() =>
                         {
                             broker?.Cancel(oid);
                             return Task.CompletedTask;
@@ -1328,7 +1333,7 @@ namespace MBO_Market_Data_Analytics
             Side bracketSide = entrySide == Side.Buy ? Side.Sell : Side.Buy;
             double tickSize = CurrentSymbol.TickSize;
 
-            prioritizedQueue?.Enqueue(() =>
+            scheduler?.Post(() =>
             {
                 if (slTicks > 0)
                 {
@@ -1504,7 +1509,7 @@ namespace MBO_Market_Data_Analytics
                         {
                             string oid = state.OrderId;
                             Log($"[Bracket Adjust] Cancelling bracket order {oid}.", StrategyLoggingLevel.Trading);
-                            prioritizedQueue?.Enqueue(() =>
+                            scheduler?.Post(() =>
                             {
                                 broker?.Cancel(oid);
                                 return Task.CompletedTask;
@@ -1523,7 +1528,7 @@ namespace MBO_Market_Data_Analytics
                             double newTotal = state.FilledQuantity + desiredRemaining;
                             string ordId = state.OrderId;
                             Log($"[Bracket Adjust] Modifying bracket {ordId}: remaining {remainingOrderQty} -> {desiredRemaining} (total qty -> {newTotal}).", StrategyLoggingLevel.Trading);
-                            prioritizedQueue?.Enqueue(() =>
+                            scheduler?.Post(() =>
                             {
                                 var modResult = broker!.ModifyQuantity(ordId, newTotal);
                                 if (modResult.Success)
@@ -1741,7 +1746,7 @@ namespace MBO_Market_Data_Analytics
 
     // H-08: classifies queued broker work so the lifecycle can selectively drop entries (on halt)
     // while preserving protection/flatten work already scheduled.
-    internal enum TaskCategory : byte { General, EntryPlacement, Protection, Flatten }
+    public enum TaskCategory : byte { General, EntryPlacement, Protection, Flatten }
 
     internal sealed class PrioritizedAsyncTaskQueue
     {

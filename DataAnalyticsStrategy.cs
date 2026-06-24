@@ -814,21 +814,45 @@ namespace MBO_Market_Data_Analytics
                     !isConnectionActive || isOrderPlacementPending || isWithinCooldown)
                     return;
 
-                // Worst-case exposure = confirmed position + unfilled working entries (same side) + proposed order.
-                // Checking only currentPositionSize would allow over-exposure when entry orders are pending.
-                double pendingSameSide = trackedOrders.Values
-                    .Where(o => o.Side == side && o.Role == OrderRole.Entry &&
+                // H-12: directional single-entry policy — at most ONE working entry across BOTH sides.
+                // The previous side-specific check let a working buy entry and a working sell entry
+                // coexist (unlinked), which could fill into churn or an unintended position transition.
+                var workingEntries = trackedOrders.Values
+                    .Where(o => o.Role == OrderRole.Entry &&
                                 (o.Status == OrderStatus.Opened || o.Status == OrderStatus.PartiallyFilled))
-                    .Sum(o => o.Quantity - o.FilledQuantity);
+                    .ToList();
+
+                // Same-side entry already working — do not stack a second.
+                if (workingEntries.Any(o => o.Side == side))
+                    return;
+
+                // Opposite-side entry working — cancel/replace it and defer this entry to a later
+                // confirmation, so the strategy never holds both sides working at once.
+                var opposite = workingEntries.Where(o => o.Side != side).ToList();
+                if (opposite.Count > 0)
+                {
+                    foreach (var oe in opposite)
+                    {
+                        var ord = oe.OrderInstance;
+                        if (ord != null)
+                            prioritizedQueue?.Enqueue(() => { ord.Cancel(); return Task.CompletedTask; }, 1, TaskCategory.Protection);
+                    }
+                    Log($"[Entry Policy] Opposite-side working entry present; cancelling it before a {side} entry.", StrategyLoggingLevel.Trading);
+                    // Reset this side's signal latch so the entry re-fires on the next qualifying tick,
+                    // by which point the opposite cancel has cleared (cancel-then-place across ticks).
+                    if (side == Side.Buy) buySignalActive = false; else sellSignalActive = false;
+                    return;
+                }
+
+                // Worst-case exposure = confirmed position + proposed order (no working entries remain
+                // on this side after the checks above). Checking only currentPositionSize would allow
+                // over-exposure against the open position.
                 bool exposureOk = side == Side.Buy
-                    ? currentPositionSize + pendingSameSide + OrderQty <= MaxExposure
-                    : -currentPositionSize + pendingSameSide + OrderQty <= MaxExposure;
+                    ? currentPositionSize + OrderQty <= MaxExposure
+                    : -currentPositionSize + OrderQty <= MaxExposure;
                 if (!exposureOk) return;
 
-                bool hasPending = trackedOrders.Values.Any(o => o.Side == side && o.Role != OrderRole.Bracket &&
-                    (o.Status == OrderStatus.Opened || o.Status == OrderStatus.PartiallyFilled));
-                if (!hasPending)
-                    PlaceOrderAsync(side);
+                PlaceOrderAsync(side);
             }
             else
             {

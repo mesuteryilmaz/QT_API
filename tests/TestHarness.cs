@@ -51,6 +51,7 @@ namespace MBO_Market_Data_Analytics.Tests
                 ExecutionCoreFillTests.RunAll();
                 ExecutionCoreBracketTests.RunAll();
                 ExecutionCoreEntryTests.RunAll();
+                ExecutionCoreReconcileTests.RunAll();
             }
             catch (Exception ex)
             {

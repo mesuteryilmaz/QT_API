@@ -61,6 +61,7 @@ namespace MBO_Market_Data_Analytics
         private volatile bool isRiskHalted;
         private int consecutiveOrderFailures;
         private volatile bool isOrderPlacementPending;
+        private volatile bool foreignExposureDetected;
 
         /// <summary>Per-run id embedded in placed-order comments (set by the strategy adapter).</summary>
         public string RunId = "";
@@ -80,6 +81,88 @@ namespace MBO_Market_Data_Analytics
 
         private string EntryComment() => $"MBO:ENTRY|{RunId}";
         private string BracketComment() => $"MBO:BRK|{RunId}";
+
+        public bool ForeignExposureDetected => foreignExposureDetected;
+
+        // ===================== reconcile / lifecycle entry points (strategy adapter) =====================
+
+        /// <summary>Resets all execution state for a fresh run and stamps the run id.</summary>
+        public void BeginRun(string runId)
+        {
+            RunId = runId ?? "";
+            lock (lifecycleLock)
+            {
+                lifecycle = StrategyLifecycleState.Initializing;
+                flattenInFlight = false;
+                flattenGeneration = 0;
+            }
+            isRiskHalted = false;
+            isOrderPlacementPending = false;
+            consecutiveOrderFailures = 0;
+            foreignExposureDetected = false;
+            lock (stateLock)
+            {
+                currentPositionSize = 0.0;
+                averageEntryPrice = 0.0;
+                strategyRealizedPnL = 0.0;
+                pnlAtLastFlat = 0.0;
+            }
+            trackedOrders.Clear();
+        }
+
+        public void SetForeignExposure(bool detected) => foreignExposureDetected = detected;
+
+        /// <summary>Restores the owned position from broker truth during reconciliation.</summary>
+        public void SetPosition(double size, double avgPrice)
+        {
+            lock (stateLock)
+            {
+                currentPositionSize = size;
+                averageEntryPrice = size == 0.0 ? 0.0 : avgPrice;
+            }
+            log($"[Reconciliation] Restored position: {size} @ {avgPrice}.", StrategyLoggingLevel.Info);
+        }
+
+        /// <summary>Drops tracked orders that are no longer in the live managed set (terminated).</summary>
+        public void ClearOrdersNotIn(ISet<string> liveManagedIds)
+        {
+            foreach (var id in trackedOrders.Keys.ToList())
+                if (!liveManagedIds.Contains(id))
+                    trackedOrders.TryRemove(id, out _);
+        }
+
+        public bool IsTracked(string orderId) => trackedOrders.ContainsKey(orderId);
+
+        /// <summary>
+        /// Teardown (the strategy's OnStop). Halts, stops + drains the scheduler, then synchronously
+        /// cancels working orders and flattens the broker position, and marks Stopped. Synchronous so
+        /// it runs deterministically against the final broker state during platform teardown.
+        /// </summary>
+        public void Shutdown()
+        {
+            TransitionTo(StrategyLifecycleState.Halting, "shutdown");
+            scheduler.StopAccepting();
+            scheduler.CancelPendingEntries();
+            scheduler.Shutdown();
+
+            foreach (var o in trackedOrders.Values)
+            {
+                if (o.OrderId != null && (o.Status == OrderStatus.Opened || o.Status == OrderStatus.PartiallyFilled))
+                {
+                    try { broker.Cancel(o.OrderId); } catch { /* best effort on teardown */ }
+                }
+            }
+
+            double pos = broker.GetNetPositionSize();
+            if (pos != 0.0)
+            {
+                log($"[Shutdown] Flattening open position ({pos:+0.##;-0.##}).", StrategyLoggingLevel.Error);
+                try { broker.PlaceMarketClose(pos > 0.0 ? Side.Sell : Side.Buy, Math.Abs(pos), ""); }
+                catch { /* best effort */ }
+            }
+
+            TransitionTo(StrategyLifecycleState.Stopped, "stopped");
+        }
 
         // ---- read-only state (consumed by the strategy's signal layer and by tests) ----
         public StrategyLifecycleState Lifecycle => lifecycle;

@@ -20,6 +20,7 @@
     <Compile Include="AnalyticsEngineHost.cs" />
     <Compile Include="Broker.cs" />
     <Compile Include="ExecutionScheduler.cs" />
+    <Compile Include="ExecutionCore.cs" />
     <Compile Include="ShadowSimulator.cs" />
     <Compile Include="MboOrderBook.cs" />
     <Compile Include="MboRecorder.cs" />

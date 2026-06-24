@@ -47,6 +47,7 @@ namespace MBO_Market_Data_Analytics.Tests
                 AdaptiveParameterControllerTests.RunAll();
                 MboOrderBookTests.RunAll();
                 FakesSmokeTests.RunAll();
+                ExecutionCoreFlattenTests.RunAll();
             }
             catch (Exception ex)
             {

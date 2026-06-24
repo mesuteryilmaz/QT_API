@@ -1167,68 +1167,81 @@ namespace MBO_Market_Data_Analytics
             }
         }
 
+        // Quantower event adapter: extract a platform-neutral snapshot and delegate to the testable
+        // handler. The Order instance is only needed here to unsubscribe once the order is terminal.
         private void OnOrderUpdated(IOrder order)
         {
-            if (order is Order ord && trackedOrders.TryGetValue(ord.Id, out var state))
+            if (order is not Order ord) return;
+            var snap = new OrderSnapshot(ord.Id, ord.Side, ord.Status,
+                                         ord.TotalQuantity, ord.FilledQuantity, ord.AverageFillPrice);
+            bool terminal = ApplyOrderUpdate(snap);
+            if (terminal) ord.Updated -= OnOrderUpdated;
+        }
+
+        // Platform-free fill/status handler. Returns true if the order reached a terminal status so
+        // the caller can unsubscribe. Driven directly by tests via fabricated OrderSnapshots.
+        private bool ApplyOrderUpdate(OrderSnapshot snap)
+        {
+            if (!trackedOrders.TryGetValue(snap.OrderId, out var state))
+                return false;
+
+            var newStatus = snap.Status;
+            var oldFilled = state.FilledQuantity;
+            var newFilled = snap.FilledQuantity;
+            double oldCumAvg = state.CumAverageFillPrice;
+            double newCumAvg = snap.AverageFillPrice > 0 ? snap.AverageFillPrice : state.Price;
+
+            // H-09: atomically replace the immutable state. A single order's Updated events are
+            // serialized by the platform, so this read-modify-write is not re-entered for the
+            // same key; other threads only ever read a complete prior/next snapshot.
+            trackedOrders[snap.OrderId] = state with
             {
-                var oldStatus = state.Status;
-                var newStatus = ord.Status;
-                var oldFilled = state.FilledQuantity;
-                var newFilled = ord.FilledQuantity;
-                double oldCumAvg = state.CumAverageFillPrice;
-                double newCumAvg = ord.AverageFillPrice > 0 ? ord.AverageFillPrice : state.Price;
+                Status = newStatus,
+                FilledQuantity = newFilled,
+                CumAverageFillPrice = newCumAvg
+            };
 
-                // H-09: atomically replace the immutable state. A single order's Updated events are
-                // serialized by the platform, so this read-modify-write is not re-entered for the
-                // same key; other threads only ever read a complete prior/next snapshot.
-                trackedOrders[ord.Id] = state with
+            if (newFilled > oldFilled)
+            {
+                double filledDiff = newFilled - oldFilled;
+                Log($"[Fill Alert] Order {snap.OrderId} filled: {oldFilled} -> {newFilled} (Diff: {filledDiff})", StrategyLoggingLevel.Trading);
+
+                // M-12: AverageFillPrice is cumulative; derive the marginal price for this increment.
+                double marginalPrice = (oldFilled <= 0 || oldCumAvg <= 0)
+                    ? newCumAvg
+                    : (newFilled * newCumAvg - oldFilled * oldCumAvg) / filledDiff;
+                if (marginalPrice <= 0) marginalPrice = state.Price;
+
+                // C-06: a broker fill is FINAL and cannot be cancelled — never "reject" it. Apply it
+                // to local state (broker truth wins), then handle the consequences.
+                bool wasFlatBefore;
+                lock (stateLock) { wasFlatBefore = currentPositionSize == 0.0; }
+
+                ProcessExecutionFill(snap.Side, marginalPrice, filledDiff);
+
+                if (state.Role == OrderRole.Entry)
                 {
-                    Status = newStatus,
-                    FilledQuantity = newFilled,
-                    CumAverageFillPrice = newCumAvg
-                };
-
-                if (newFilled > oldFilled)
-                {
-                    double filledDiff = newFilled - oldFilled;
-                    Log($"[Fill Alert] Order {ord.Id} filled: {oldFilled} -> {newFilled} (Diff: {filledDiff})", StrategyLoggingLevel.Trading);
-
-                    // M-12: AverageFillPrice is cumulative; derive the marginal price for this increment.
-                    double marginalPrice = (oldFilled <= 0 || oldCumAvg <= 0)
-                        ? newCumAvg
-                        : (newFilled * newCumAvg - oldFilled * oldCumAvg) / filledDiff;
-                    if (marginalPrice <= 0) marginalPrice = state.Price;
-
-                    // C-06: a broker fill is FINAL and cannot be cancelled — never "reject" it. Apply it
-                    // to local state (broker truth wins), then handle the consequences.
-                    bool wasFlatBefore;
-                    lock (stateLock) { wasFlatBefore = currentPositionSize == 0.0; }
-
-                    ProcessExecutionFill(ord.Side, marginalPrice, filledDiff);
-
-                    if (state.Role == OrderRole.Entry)
-                    {
-                        // Our own signal entry — attach protective brackets.
-                        ManageBracketsForFill(ord.Side, marginalPrice, filledDiff);
-                    }
-                    else if (state.Role == OrderRole.Bracket && wasFlatBefore)
-                    {
-                        // C-06: a protective bracket filled while we were already flat — its sibling had
-                        // closed the position first, so this final fill just opened a REVERSED position.
-                        // State is already reconciled above; now halt + flatten (which cancels the
-                        // sibling) instead of the old behaviour of "rejecting" an unrejectable fill.
-                        Log($"[OCO] Bracket {ord.Id} filled while already flat — broker opened a reversed position. Halting and flattening.", StrategyLoggingLevel.Error);
-                        Halt($"late bracket fill reversed position (order {ord.Id})");
-                    }
+                    // Our own signal entry — attach protective brackets.
+                    ManageBracketsForFill(snap.Side, marginalPrice, filledDiff);
                 }
-
-                if (newStatus == OrderStatus.Filled || newStatus == OrderStatus.Cancelled || newStatus == OrderStatus.Refused)
+                else if (state.Role == OrderRole.Bracket && wasFlatBefore)
                 {
-                    Log($"[Order Finished] Order {ord.Id} finished with status: {newStatus}", StrategyLoggingLevel.Trading);
-                    ord.Updated -= OnOrderUpdated;
-                    trackedOrders.TryRemove(ord.Id, out _);
+                    // C-06: a protective bracket filled while we were already flat — its sibling had
+                    // closed the position first, so this final fill just opened a REVERSED position.
+                    // State is already reconciled above; now halt + flatten (which cancels the
+                    // sibling) instead of the old behaviour of "rejecting" an unrejectable fill.
+                    Log($"[OCO] Bracket {snap.OrderId} filled while already flat — broker opened a reversed position. Halting and flattening.", StrategyLoggingLevel.Error);
+                    Halt($"late bracket fill reversed position (order {snap.OrderId})");
                 }
             }
+
+            bool terminal = newStatus == OrderStatus.Filled || newStatus == OrderStatus.Cancelled || newStatus == OrderStatus.Refused;
+            if (terminal)
+            {
+                Log($"[Order Finished] Order {snap.OrderId} finished with status: {newStatus}", StrategyLoggingLevel.Trading);
+                trackedOrders.TryRemove(snap.OrderId, out _);
+            }
+            return terminal;
         }
 
         private void ProcessExecutionFill(Side fillSide, double fillPrice, double fillQty)

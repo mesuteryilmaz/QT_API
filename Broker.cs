@@ -25,6 +25,32 @@ namespace MBO_Market_Data_Analytics
     }
 
     /// <summary>
+    /// Platform-neutral snapshot of an order's state at the moment of an update. The host adapter
+    /// builds this from a Quantower Order so the execution logic (and its tests) can process fills
+    /// without depending on the Order type.
+    /// </summary>
+    public readonly struct OrderSnapshot
+    {
+        public readonly string OrderId;
+        public readonly Side Side;
+        public readonly OrderStatus Status;
+        public readonly double TotalQuantity;
+        public readonly double FilledQuantity;
+        public readonly double AverageFillPrice;
+
+        public OrderSnapshot(string orderId, Side side, OrderStatus status,
+                             double totalQuantity, double filledQuantity, double averageFillPrice)
+        {
+            OrderId = orderId ?? "";
+            Side = side;
+            Status = status;
+            TotalQuantity = totalQuantity;
+            FilledQuantity = filledQuantity;
+            AverageFillPrice = averageFillPrice;
+        }
+    }
+
+    /// <summary>
     /// Seam over the broker. All OUTBOUND order operations the execution logic performs go through
     /// this interface so the logic can be driven by a deterministic fake broker in tests, instead of
     /// calling the unmockable Core.Instance singleton directly. Inbound events (order updates, fills,

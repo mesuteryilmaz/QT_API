@@ -196,6 +196,12 @@ namespace MBO_Market_Data_Analytics
         private string runId = "";
         private volatile bool foreignExposureDetected = false;
 
+        // C-08 lifecycle + idempotent flatten state.
+        private volatile StrategyLifecycleState lifecycle = StrategyLifecycleState.Initializing;
+        private readonly object lifecycleLock = new object();
+        private int flattenGeneration = 0;
+        private volatile bool flattenInFlight = false;
+
         private static OrderRole RoleFromComment(string? comment)
         {
             if (!string.IsNullOrEmpty(comment))
@@ -248,6 +254,11 @@ namespace MBO_Market_Data_Analytics
             averageEntryPrice = 0.0;
             currentPositionSize = 0.0;
             trackedOrders.Clear();
+
+            // C-08: reset lifecycle + flatten state for a fresh run.
+            lifecycle = StrategyLifecycleState.Initializing;
+            flattenInFlight = false;
+            flattenGeneration = 0;
 
             // C-09: stamp this run. Every order placed below carries "TAG|runId" so the strategy
             // manages only its own orders and can be told apart from other instances / manual trades.
@@ -351,13 +362,24 @@ namespace MBO_Market_Data_Analytics
             // connection flags, and broker position are all set. The worker's OnEventProcessed callback
             // (EvaluateTradingSignal) cannot fire until Start() is called.
             engine.Start();
+
+            // C-08: all state is ready — enter Running so entry generation is enabled.
+            TransitionTo(StrategyLifecycleState.Running, "initialization complete");
         }
 
         protected override void OnStop()
         {
+            // C-08: enter Halting and tear the queue down FIRST — stop accepting, drop pending
+            // entries, and bounded-join any in-flight task. This guarantees no queued flatten/close
+            // can run concurrently with the synchronous teardown flatten below (no double close).
+            TransitionTo(StrategyLifecycleState.Halting, "strategy stop");
+            prioritizedQueue?.StopAccepting();
+            prioritizedQueue?.CancelPendingEntries();
+            prioritizedQueue?.Shutdown();
+
             // H-24: Cancel all working broker orders and flatten any open position before teardown.
-            // Done synchronously here (not via prioritizedQueue) so it executes even if the queue
-            // is already draining or not yet processing.
+            // Done synchronously here (not via prioritizedQueue, which is now stopped) so it executes
+            // deterministically against the final broker position.
             foreach (var kv in trackedOrders)
             {
                 var state = kv.Value;
@@ -422,9 +444,10 @@ namespace MBO_Market_Data_Analytics
             }
             trackedOrders.Clear();
 
-            prioritizedQueue?.Shutdown();
-
             isOrderPlacementPending = false;
+
+            // C-08: teardown complete (terminal state).
+            TransitionTo(StrategyLifecycleState.Stopped, "strategy stopped");
 
             // Force garbage collection to flush and release any open Serilog files
             GC.Collect();
@@ -438,7 +461,7 @@ namespace MBO_Market_Data_Analytics
             // Flat open positions at CME session end
             prioritizedQueue?.Enqueue(() =>
             {
-                FlattenPosition();
+                FlattenPosition("session rollover");
                 return Task.CompletedTask;
             }, 0, TaskCategory.Flatten);
 
@@ -753,20 +776,24 @@ namespace MBO_Market_Data_Analytics
             if (!wantLive || lastPrice <= 0.0 || MaxDailyLoss <= 0.0)
                 return false;
 
+            bool breach;
+            double totalPnL;
             lock (stateLock)
             {
                 // currentPositionSize carries the sign, so currentPositionSize * (lastPrice -
                 // averageEntryPrice) * pointCost is correct for both long and short positions.
                 double pointCost = GetPointCost();
                 double openPnL = currentPositionSize * (lastPrice - averageEntryPrice) * pointCost;
-                double totalPnL = strategyRealizedPnL + openPnL;
-                if (totalPnL <= -MaxDailyLoss)
-                {
-                    isRiskHalted = true;
-                    Log($"[Risk Limit] Daily loss threshold of -{MaxDailyLoss:C2} exceeded. PnL: {totalPnL:C2}. Flattening and Halting.", StrategyLoggingLevel.Error);
-                    FlattenPosition();
-                    return true;
-                }
+                totalPnL = strategyRealizedPnL + openPnL;
+                breach = totalPnL <= -MaxDailyLoss;
+            }
+
+            if (breach)
+            {
+                // Call Halt OUTSIDE stateLock to avoid nesting stateLock -> lifecycleLock.
+                Log($"[Risk Limit] Daily loss threshold of -{MaxDailyLoss:C2} exceeded. PnL: {totalPnL:C2}. Flattening and Halting.", StrategyLoggingLevel.Error);
+                Halt($"daily loss exceeded (PnL {totalPnL:C2})");
+                return true;
             }
             return false;
         }
@@ -777,7 +804,10 @@ namespace MBO_Market_Data_Analytics
         {
             if (wantLive)
             {
-                if (isRiskHalted || !isConnectionActive || isOrderPlacementPending || isWithinCooldown)
+                // C-08: new live entries only in Running. A hard halt (Halting/Flattening/FlatVerified)
+                // or teardown (Stopped) blocks them, alongside the existing risk/connection gates.
+                if (isRiskHalted || lifecycle != StrategyLifecycleState.Running ||
+                    !isConnectionActive || isOrderPlacementPending || isWithinCooldown)
                     return;
 
                 // Worst-case exposure = confirmed position + unfilled working entries (same side) + proposed order.
@@ -860,7 +890,7 @@ namespace MBO_Market_Data_Analytics
                 if (demote)
                 {
                     isLivePromoted = false;
-                    FlattenPosition();
+                    FlattenPosition("demotion to shadow"); // continue running in shadow; not a hard halt
                     shadowSim.Reset();
                     Log($"[Demotion] Reverting to SHADOW (paper). Live trades: {liveCount}, riskHalted: {isRiskHalted}. Re-validating on fresh paper record.", StrategyLoggingLevel.Error);
                 }
@@ -928,9 +958,8 @@ namespace MBO_Market_Data_Analytics
 
                         if (consecutiveOrderFailures >= MaxConsecutiveFailures)
                         {
-                            isRiskHalted = true;
                             Log($"[Risk Limit] Strategy halted due to {consecutiveOrderFailures} consecutive order placement failures. Check broker settings.", StrategyLoggingLevel.Error);
-                            FlattenPosition();
+                            Halt($"{consecutiveOrderFailures} consecutive order placement failures");
                         }
                     }
                 }
@@ -941,9 +970,8 @@ namespace MBO_Market_Data_Analytics
 
                     if (consecutiveOrderFailures >= MaxConsecutiveFailures)
                     {
-                        isRiskHalted = true;
                         Log($"[Risk Limit] Strategy halted due to {consecutiveOrderFailures} consecutive order placement failures.", StrategyLoggingLevel.Error);
-                        FlattenPosition();
+                        Halt($"{consecutiveOrderFailures} consecutive order placement failures (exception path)");
                     }
                 }
                 finally
@@ -955,14 +983,75 @@ namespace MBO_Market_Data_Analytics
             }, 2, TaskCategory.EntryPlacement);
         }
 
-        private void FlattenPosition()
+        // C-08: drives a hard halt. Stops new entries (lifecycle + isRiskHalted), drops any queued
+        // entry-placement tasks, and starts one idempotent flatten. Call OUTSIDE stateLock.
+        private void Halt(string reason)
         {
-            Log("[Flattening] Cancelling pending orders and market closing position...", StrategyLoggingLevel.Info);
+            isRiskHalted = true;
+            TransitionTo(StrategyLifecycleState.Halting, reason);
+            int dropped = prioritizedQueue?.CancelPendingEntries() ?? 0;
+            if (dropped > 0)
+                Log($"[Lifecycle] Cancelled {dropped} pending entry-placement task(s) on halt.", StrategyLoggingLevel.Info);
+            FlattenPosition(reason);
+        }
+
+        // C-08: single guarded lifecycle transition with logging. Stopped is terminal.
+        private void TransitionTo(StrategyLifecycleState next, string reason)
+        {
+            StrategyLifecycleState prev;
+            lock (lifecycleLock)
+            {
+                prev = lifecycle;
+                if (prev == next || prev == StrategyLifecycleState.Stopped) return;
+                lifecycle = next;
+            }
+            Log($"[Lifecycle] {prev} -> {next}: {reason}", StrategyLoggingLevel.Info);
+        }
+
+        // C-08: called when the broker position is observed flat (position-removed or a flat
+        // reconcile). Clears the in-flight guard and, if we were flattening on a hard halt,
+        // advances to FlatVerified.
+        private void OnFlattenConfirmedFlat(string source)
+        {
+            bool wasInFlight;
+            lock (lifecycleLock)
+            {
+                wasInFlight = flattenInFlight;
+                if (!wasInFlight) return;
+                if (GetBrokerPositionSize() != 0.0) return; // not actually flat yet
+                flattenInFlight = false;
+                if (lifecycle == StrategyLifecycleState.Flattening)
+                    lifecycle = StrategyLifecycleState.FlatVerified;
+            }
+            Log($"[Flatten] Generation {flattenGeneration} confirmed flat ({source}).", StrategyLoggingLevel.Info);
+        }
+
+        // C-08: idempotent. If a flatten is already in flight, a duplicate request is a no-op — this
+        // prevents the previous behaviour where each call enqueued another full-size market close
+        // (over-closing and reversing the account). Continues running for non-halt flattens
+        // (demotion / session rollover); only a hard Halt() advances the lifecycle to FlatVerified.
+        private void FlattenPosition(string reason = "")
+        {
+            lock (lifecycleLock)
+            {
+                if (flattenInFlight)
+                {
+                    Log($"[Flatten] Already in flight (generation {flattenGeneration}); ignoring duplicate request{(string.IsNullOrEmpty(reason) ? "" : $" ({reason})")}.", StrategyLoggingLevel.Info);
+                    return;
+                }
+                flattenInFlight = true;
+                flattenGeneration++;
+                if (lifecycle == StrategyLifecycleState.Halting)
+                    lifecycle = StrategyLifecycleState.Flattening;
+            }
+
+            int gen = flattenGeneration;
+            Log($"[Flatten] Generation {gen} starting{(string.IsNullOrEmpty(reason) ? "" : $" ({reason})")}: cancelling working orders and market-closing position.", StrategyLoggingLevel.Info);
 
             // 1. Cancel all working orders in the prioritized queue (priority 0)
             foreach (var trackedOrder in trackedOrders.Values)
             {
-                if (trackedOrder.OrderInstance != null && 
+                if (trackedOrder.OrderInstance != null &&
                     (trackedOrder.Status == OrderStatus.Opened || trackedOrder.Status == OrderStatus.PartiallyFilled))
                 {
                     var ord = trackedOrder.OrderInstance;
@@ -978,27 +1067,40 @@ namespace MBO_Market_Data_Analytics
             prioritizedQueue?.Enqueue(() =>
             {
                 double posSize = GetBrokerPositionSize();
-                if (posSize != 0.0)
+                if (posSize == 0.0)
                 {
-                    Side flatSide = posSize > 0.0 ? Side.Sell : Side.Buy;
-                    double qty = Math.Abs(posSize);
-                    Log($"[Flatten Placement] Placing Market order on {flatSide} for {qty} contracts.", StrategyLoggingLevel.Info);
-                    
-                    var marketType = CurrentSymbol?.GetAlowedOrderTypes(OrderTypeUsage.Order)
-                                        .FirstOrDefault(ot => ot.Behavior == OrderTypeBehavior.Market) ??
-                                    CurrentSymbol?.GetAlowedOrderTypes(OrderTypeUsage.All)
-                                        .FirstOrDefault(ot => ot.Behavior == OrderTypeBehavior.Market);
-                    string orderTypeId = marketType?.Id ?? OrderType.Market;
-
-                    Core.Instance.PlaceOrder(new PlaceOrderRequestParameters
-                    {
-                        Symbol = CurrentSymbol,
-                        Account = CurrentAccount,
-                        Side = flatSide,
-                        OrderTypeId = orderTypeId,
-                        Quantity = qty
-                    });
+                    // Already flat by the time the close runs (e.g. brackets closed it first).
+                    OnFlattenConfirmedFlat($"already flat at flatten gen {gen}");
+                    return Task.CompletedTask;
                 }
+
+                Side flatSide = posSize > 0.0 ? Side.Sell : Side.Buy;
+                double qty = Math.Abs(posSize);
+                Log($"[Flatten Placement] Generation {gen}: Market {flatSide} for {qty} contracts.", StrategyLoggingLevel.Info);
+
+                var marketType = CurrentSymbol?.GetAlowedOrderTypes(OrderTypeUsage.Order)
+                                    .FirstOrDefault(ot => ot.Behavior == OrderTypeBehavior.Market) ??
+                                CurrentSymbol?.GetAlowedOrderTypes(OrderTypeUsage.All)
+                                    .FirstOrDefault(ot => ot.Behavior == OrderTypeBehavior.Market);
+                string orderTypeId = marketType?.Id ?? OrderType.Market;
+
+                var flatResult = Core.Instance.PlaceOrder(new PlaceOrderRequestParameters
+                {
+                    Symbol = CurrentSymbol,
+                    Account = CurrentAccount,
+                    Side = flatSide,
+                    OrderTypeId = orderTypeId,
+                    Quantity = qty
+                });
+
+                if (flatResult.Status != TradingOperationResultStatus.Success)
+                {
+                    // C-08: the close was not accepted — release the in-flight guard so a subsequent
+                    // event can retry, rather than leaving the position stuck with flattenInFlight=true.
+                    Log($"[Flatten Placement] Generation {gen} market close REJECTED: {flatResult.Message}. Releasing flatten guard for retry.", StrategyLoggingLevel.Error);
+                    lock (lifecycleLock) { flattenInFlight = false; }
+                }
+                // On success leave flattenInFlight=true; OnCorePositionRemoved/reconcile confirms flat.
                 return Task.CompletedTask;
             }, 1, TaskCategory.Flatten);
         }
@@ -1077,6 +1179,7 @@ namespace MBO_Market_Data_Analytics
             {
                 Log("[Position Removed] Reconciling broker position state...", StrategyLoggingLevel.Info);
                 ReconcileBrokerState();
+                OnFlattenConfirmedFlat("position removed"); // C-08: clear flatten guard once broker confirms flat
             }
         }
 
@@ -1281,9 +1384,8 @@ namespace MBO_Market_Data_Analytics
                         {
                             // A missing SL means the position has no downside protection.
                             // Flatten immediately regardless of consecutive-failure count.
-                            isRiskHalted = true;
                             Log($"[Risk Limit] SL placement failed: {slResult.Message}. Flattening — open position has no stop loss.", StrategyLoggingLevel.Error);
-                            FlattenPosition();
+                            Halt($"stop-loss placement failed ({slResult.Message})");
                             return Task.CompletedTask; // skip TP placement — no point protecting upside without a stop
                         }
                     }
@@ -1335,9 +1437,8 @@ namespace MBO_Market_Data_Analytics
                         consecutiveOrderFailures++;
                         if (consecutiveOrderFailures >= MaxConsecutiveFailures)
                         {
-                            isRiskHalted = true;
                             Log($"[Risk Limit] Strategy halted due to bracket TP placement failure.", StrategyLoggingLevel.Error);
-                            FlattenPosition();
+                            Halt("bracket TP placement failure");
                         }
                     }
                 }
@@ -1566,6 +1667,10 @@ namespace MBO_Market_Data_Analytics
             {
                 foreignExposureDetected = false;
             }
+
+            // C-08: if a flatten was in flight and the broker is now flat, release the guard here too
+            // (defensive — covers a missed PositionRemoved event). No-ops unless actually flat.
+            OnFlattenConfirmedFlat("reconcile");
         }
     }
 
@@ -1576,6 +1681,18 @@ namespace MBO_Market_Data_Analytics
         Entry,       // Our own signal entry order
         Bracket,     // Our own SL/TP protective order
         Reconciled   // Re-discovered from the broker; role unknown
+    }
+
+    // C-08: strategy execution lifecycle. New live entries are only generated in Running; a hard
+    // halt drives Halting -> Flattening -> FlatVerified, and teardown ends in Stopped.
+    internal enum StrategyLifecycleState : byte
+    {
+        Initializing,
+        Running,
+        Halting,
+        Flattening,
+        FlatVerified,
+        Stopped
     }
 
     // Helper state structures.

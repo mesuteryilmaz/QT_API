@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using TradingPlatform.BusinessLayer;
@@ -35,11 +37,20 @@ namespace MBO_Market_Data_Analytics
         private readonly IExecScheduler scheduler;
         private readonly Action<string, StrategyLoggingLevel> log;
         private readonly ExecConfig cfg;
+        // Round-trip realized PnL (for the strategy's promotion tracker) and entry-fill notification
+        // (the strategy attaches protective brackets — that placement logic is the next slice).
+        private readonly Action<double> onRoundTripClosed;
+        private readonly Action<Side, double, double> onEntryFilled;
 
         private readonly ConcurrentDictionary<string, TrackedOrderState> trackedOrders = new();
         private readonly object lifecycleLock = new();
+        private readonly object stateLock = new();
 
-        // Position/PnL state arrives with the fills slice; today's slice is lifecycle + flatten only.
+        // Owned position/PnL state (our fills only).
+        private double currentPositionSize;
+        private double averageEntryPrice;
+        private double strategyRealizedPnL;
+        private double pnlAtLastFlat;
 
         private volatile StrategyLifecycleState lifecycle = StrategyLifecycleState.Initializing;
         private int flattenGeneration;
@@ -47,12 +58,16 @@ namespace MBO_Market_Data_Analytics
         private volatile bool isRiskHalted;
 
         public ExecutionCore(IBroker broker, IExecScheduler scheduler,
-                             Action<string, StrategyLoggingLevel> log, ExecConfig cfg)
+                             Action<string, StrategyLoggingLevel> log, ExecConfig cfg,
+                             Action<double>? onRoundTripClosed = null,
+                             Action<Side, double, double>? onEntryFilled = null)
         {
             this.broker = broker ?? throw new ArgumentNullException(nameof(broker));
             this.scheduler = scheduler ?? throw new ArgumentNullException(nameof(scheduler));
             this.log = log ?? ((_, __) => { });
             this.cfg = cfg ?? new ExecConfig();
+            this.onRoundTripClosed = onRoundTripClosed ?? (_ => { });
+            this.onEntryFilled = onEntryFilled ?? ((_, __, ___) => { });
         }
 
         // ---- read-only state (consumed by the strategy's signal layer and by tests) ----
@@ -60,6 +75,9 @@ namespace MBO_Market_Data_Analytics
         public bool IsRiskHalted => isRiskHalted;
         public bool FlattenInFlight => flattenInFlight;
         public int FlattenGeneration => flattenGeneration;
+        public double PositionSize { get { lock (stateLock) return currentPositionSize; } }
+        public double AverageEntryPrice { get { lock (stateLock) return averageEntryPrice; } }
+        public double RealizedPnL { get { lock (stateLock) return strategyRealizedPnL; } }
 
         public int WorkingOrderCount
         {
@@ -75,6 +93,213 @@ namespace MBO_Market_Data_Analytics
         // ---- setup / reconcile helpers ----
         public void SetRunning() => TransitionTo(StrategyLifecycleState.Running, "running");
         public void Track(TrackedOrderState s) { if (s.OrderId != null) trackedOrders[s.OrderId] = s; }
+
+        // ===================== C-06: fills + position accounting =====================
+
+        /// <summary>
+        /// Platform-free fill/status handler. Returns true if the order reached a terminal status so
+        /// the caller can unsubscribe. Applies broker truth (a fill is final, never "rejected"); a
+        /// protective fill that arrives while already flat reversed the position, so it halts + flattens.
+        /// </summary>
+        public bool ApplyOrderUpdate(OrderSnapshot snap)
+        {
+            if (!trackedOrders.TryGetValue(snap.OrderId, out var state))
+                return false;
+
+            var newStatus = snap.Status;
+            var oldFilled = state.FilledQuantity;
+            var newFilled = snap.FilledQuantity;
+            double oldCumAvg = state.CumAverageFillPrice;
+            double newCumAvg = snap.AverageFillPrice > 0 ? snap.AverageFillPrice : state.Price;
+
+            // H-09: atomically replace the immutable state so cross-thread readers never see a torn mix.
+            trackedOrders[snap.OrderId] = state with
+            {
+                Status = newStatus,
+                FilledQuantity = newFilled,
+                CumAverageFillPrice = newCumAvg
+            };
+
+            if (newFilled > oldFilled)
+            {
+                double filledDiff = newFilled - oldFilled;
+                log($"[Fill Alert] Order {snap.OrderId} filled: {oldFilled} -> {newFilled} (Diff: {filledDiff})", StrategyLoggingLevel.Trading);
+
+                // M-12: AverageFillPrice is cumulative; derive the marginal price for this increment.
+                double marginalPrice = (oldFilled <= 0 || oldCumAvg <= 0)
+                    ? newCumAvg
+                    : (newFilled * newCumAvg - oldFilled * oldCumAvg) / filledDiff;
+                if (marginalPrice <= 0) marginalPrice = state.Price;
+
+                // C-06: a broker fill is FINAL — apply it (broker truth), then handle consequences.
+                bool wasFlatBefore;
+                lock (stateLock) { wasFlatBefore = currentPositionSize == 0.0; }
+
+                ProcessExecutionFill(snap.Side, marginalPrice, filledDiff);
+
+                if (state.Role == OrderRole.Entry)
+                {
+                    // Our own signal entry — attach protective brackets (placement is the next slice).
+                    onEntryFilled(snap.Side, marginalPrice, filledDiff);
+                }
+                else if (state.Role == OrderRole.Bracket && wasFlatBefore)
+                {
+                    // C-06: a protective bracket filled while already flat — its sibling had closed the
+                    // position first, so this final fill opened a REVERSED position. Halt + flatten
+                    // (which cancels the sibling) instead of "rejecting" an unrejectable fill.
+                    log($"[OCO] Bracket {snap.OrderId} filled while already flat — broker opened a reversed position. Halting and flattening.", StrategyLoggingLevel.Error);
+                    Halt($"late bracket fill reversed position (order {snap.OrderId})");
+                }
+            }
+
+            bool terminal = newStatus == OrderStatus.Filled || newStatus == OrderStatus.Cancelled || newStatus == OrderStatus.Refused;
+            if (terminal)
+            {
+                log($"[Order Finished] Order {snap.OrderId} finished with status: {newStatus}", StrategyLoggingLevel.Trading);
+                trackedOrders.TryRemove(snap.OrderId, out _);
+            }
+            return terminal;
+        }
+
+        private void ProcessExecutionFill(Side fillSide, double fillPrice, double fillQty)
+        {
+          lock (stateLock)
+          {
+            double pointCost = cfg.PointCost;
+            double fillQtySigned = fillSide == Side.Buy ? fillQty : -fillQty;
+
+            if (currentPositionSize == 0.0)
+            {
+                averageEntryPrice = fillPrice;
+                currentPositionSize = fillQtySigned;
+            }
+            else if (Math.Sign(currentPositionSize) == Math.Sign(fillQtySigned))
+            {
+                double existingAbs = Math.Abs(currentPositionSize);
+                averageEntryPrice = ((averageEntryPrice * existingAbs) + (fillPrice * fillQty)) / (existingAbs + fillQty);
+                currentPositionSize += fillQtySigned;
+            }
+            else
+            {
+                double existingAbs = Math.Abs(currentPositionSize);
+                double reductionQty = Math.Min(existingAbs, fillQty);
+                double remainingFillQty = fillQty - reductionQty;
+
+                double pnlCoeff = currentPositionSize > 0 ? 1.0 : -1.0;
+                double realized = (fillPrice - averageEntryPrice) * reductionQty * pointCost * pnlCoeff;
+                strategyRealizedPnL += realized;
+
+                log($"[PnL Update] Realized {realized:C2} on reduction of {reductionQty} contracts. Total realized PnL: {strategyRealizedPnL:C2}.", StrategyLoggingLevel.Info);
+
+                currentPositionSize += (fillSide == Side.Buy ? reductionQty : -reductionQty);
+
+                if (remainingFillQty > 0)
+                {
+                    averageEntryPrice = fillPrice;
+                    currentPositionSize = fillSide == Side.Buy ? remainingFillQty : -remainingFillQty;
+                }
+                else if (currentPositionSize == 0.0)
+                {
+                    averageEntryPrice = 0.0;
+                }
+            }
+
+            log($"[Local Position] Size: {currentPositionSize}, Average Price: {averageEntryPrice}.", StrategyLoggingLevel.Info);
+
+            if (currentPositionSize == 0.0)
+            {
+                // Round-trip complete: report realized PnL since the last flat to the promotion tracker.
+                double roundTripPnL = strategyRealizedPnL - pnlAtLastFlat;
+                pnlAtLastFlat = strategyRealizedPnL;
+                onRoundTripClosed(roundTripPnL);
+
+                // Position went flat — cancel all working bracket orders.
+                foreach (var trackedOrder in trackedOrders.Values)
+                {
+                    if (trackedOrder.Role == OrderRole.Bracket && trackedOrder.OrderId != null &&
+                        (trackedOrder.Status == OrderStatus.Opened || trackedOrder.Status == OrderStatus.PartiallyFilled))
+                    {
+                        string oid = trackedOrder.OrderId;
+                        log($"[OCO Action] Position flat. Cancelling bracket order {oid}.", StrategyLoggingLevel.Trading);
+                        scheduler.Post(() => { broker.Cancel(oid); return Task.CompletedTask; }, 0, TaskCategory.Protection);
+                    }
+                }
+            }
+            else
+            {
+                ReconcileBracketQuantities();
+            }
+          }
+        }
+
+        // C-07: classify a tracked bracket via the placement hint (the strategy sets it on every
+        // adopted bracket too), so no platform Order-type lookup is needed in the core.
+        private static bool IsWorkingStop(TrackedOrderState s) => s.IsStopHint == true;
+        private static bool IsWorkingLimit(TrackedOrderState s) => s.IsStopHint == false;
+
+        private void ReconcileBracketQuantities()
+        {
+            double absPosition = Math.Abs(currentPositionSize);
+
+            var activeSLs = trackedOrders.Values.Where(o => o.Role == OrderRole.Bracket &&
+                                                            (o.Status == OrderStatus.Opened || o.Status == OrderStatus.PartiallyFilled) &&
+                                                            IsWorkingStop(o)).ToList();
+            var activeTPs = trackedOrders.Values.Where(o => o.Role == OrderRole.Bracket &&
+                                                            (o.Status == OrderStatus.Opened || o.Status == OrderStatus.PartiallyFilled) &&
+                                                            IsWorkingLimit(o)).ToList();
+
+            AdjustBracketGroup(activeSLs, absPosition);
+            AdjustBracketGroup(activeTPs, absPosition);
+        }
+
+        private void AdjustBracketGroup(List<TrackedOrderState> brackets, double targetQty)
+        {
+            if (brackets.Count == 0) return;
+            double totalQty = brackets.Sum(o => o.Quantity - o.FilledQuantity);
+            if (totalQty <= targetQty) return;
+
+            double excess = totalQty - targetQty;
+            log($"[Bracket Adjust] Excess qty detected: {totalQty} > {targetQty}. Adjusting...", StrategyLoggingLevel.Trading);
+
+            foreach (var state in brackets)
+            {
+                if (excess <= 0) break;
+                if (state.OrderId == null) continue;
+
+                double remainingOrderQty = state.Quantity - state.FilledQuantity;
+                if (remainingOrderQty <= excess)
+                {
+                    string oid = state.OrderId;
+                    log($"[Bracket Adjust] Cancelling bracket order {oid}.", StrategyLoggingLevel.Trading);
+                    scheduler.Post(() => { broker.Cancel(oid); return Task.CompletedTask; }, 0, TaskCategory.Protection);
+                    excess -= remainingOrderQty;
+                }
+                else
+                {
+                    // H-11: modify quantity is the order TOTAL, not the remaining. For a partially
+                    // filled order set total = filled + desired remaining.
+                    double desiredRemaining = remainingOrderQty - excess;
+                    double newTotal = state.FilledQuantity + desiredRemaining;
+                    string ordId = state.OrderId;
+                    log($"[Bracket Adjust] Modifying bracket {ordId}: remaining {remainingOrderQty} -> {desiredRemaining} (total qty -> {newTotal}).", StrategyLoggingLevel.Trading);
+                    scheduler.Post(() =>
+                    {
+                        var modResult = broker.ModifyQuantity(ordId, newTotal);
+                        if (modResult.Success)
+                        {
+                            if (trackedOrders.TryGetValue(ordId, out var cur))
+                                trackedOrders[ordId] = cur with { Quantity = newTotal };
+                        }
+                        else
+                        {
+                            log($"[Bracket Adjust] Modify of {ordId} failed: {modResult.Message}.", StrategyLoggingLevel.Error);
+                        }
+                        return Task.CompletedTask;
+                    }, 1, TaskCategory.Protection);
+                    excess = 0;
+                }
+            }
+        }
 
         // ===================== C-08: lifecycle + idempotent flatten =====================
 

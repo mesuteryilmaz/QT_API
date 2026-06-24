@@ -10,6 +10,9 @@ using TradingPlatform.BusinessLayer;
 
 namespace MBO_Market_Data_Analytics
 {
+    /// <summary>Outcome of an entry submission (H-12 single-entry policy).</summary>
+    public enum EntrySubmitResult { Blocked, SameSideExists, OppositeCancelled, ExposureExceeded, Placed }
+
     /// <summary>Operator/derived configuration the execution core needs (platform-neutral).</summary>
     public sealed class ExecConfig
     {
@@ -57,6 +60,7 @@ namespace MBO_Market_Data_Analytics
         private volatile bool flattenInFlight;
         private volatile bool isRiskHalted;
         private int consecutiveOrderFailures;
+        private volatile bool isOrderPlacementPending;
 
         /// <summary>Per-run id embedded in placed-order comments (set by the strategy adapter).</summary>
         public string RunId = "";
@@ -74,6 +78,7 @@ namespace MBO_Market_Data_Analytics
             this.getBracketTicks = getBracketTicks ?? (() => (0, 0));
         }
 
+        private string EntryComment() => $"MBO:ENTRY|{RunId}";
         private string BracketComment() => $"MBO:BRK|{RunId}";
 
         // ---- read-only state (consumed by the strategy's signal layer and by tests) ----
@@ -305,6 +310,101 @@ namespace MBO_Market_Data_Analytics
                     excess = 0;
                 }
             }
+        }
+
+        // ===================== H-12: entry policy =====================
+
+        /// <summary>
+        /// H-12: directional single-entry policy. At most ONE working entry across BOTH sides. The
+        /// strategy calls this when a signal fires (after its own connection/cooldown gates). On
+        /// OppositeCancelled the strategy should reset that side's signal latch so the entry re-fires
+        /// once the cancel clears. Exposure is checked against the open position + the proposed order.
+        /// </summary>
+        public EntrySubmitResult TrySubmitEntry(Side side, double price)
+        {
+            if (lifecycle != StrategyLifecycleState.Running || isRiskHalted || isOrderPlacementPending)
+                return EntrySubmitResult.Blocked;
+
+            var workingEntries = trackedOrders.Values
+                .Where(o => o.Role == OrderRole.Entry &&
+                            (o.Status == OrderStatus.Opened || o.Status == OrderStatus.PartiallyFilled))
+                .ToList();
+
+            // Same-side entry already working — do not stack a second.
+            if (workingEntries.Any(o => o.Side == side))
+                return EntrySubmitResult.SameSideExists;
+
+            // Opposite-side entry working — cancel/replace it and defer this entry, so the strategy
+            // never holds both sides working at once.
+            var opposite = workingEntries.Where(o => o.Side != side).ToList();
+            if (opposite.Count > 0)
+            {
+                foreach (var oe in opposite)
+                {
+                    string? oid = oe.OrderId;
+                    if (oid != null)
+                        scheduler.Post(() => { broker.Cancel(oid); return Task.CompletedTask; }, 1, TaskCategory.Protection);
+                }
+                log($"[Entry Policy] Opposite-side working entry present; cancelling it before a {side} entry.", StrategyLoggingLevel.Trading);
+                return EntrySubmitResult.OppositeCancelled;
+            }
+
+            double pos;
+            lock (stateLock) { pos = currentPositionSize; }
+            bool exposureOk = side == Side.Buy
+                ? pos + cfg.OrderQty <= cfg.MaxExposure
+                : -pos + cfg.OrderQty <= cfg.MaxExposure;
+            if (!exposureOk)
+                return EntrySubmitResult.ExposureExceeded;
+
+            PlaceEntry(side, price, cfg.OrderQty);
+            return EntrySubmitResult.Placed;
+        }
+
+        private void PlaceEntry(Side side, double price, double qty)
+        {
+            isOrderPlacementPending = true;
+            scheduler.Post(() =>
+            {
+                try
+                {
+                    var result = broker.PlaceEntryLimit(side, price, qty, EntryComment());
+                    if (result.Success)
+                    {
+                        consecutiveOrderFailures = 0;
+                        Track(new TrackedOrderState
+                        {
+                            LocalId = Guid.NewGuid().ToString(),
+                            OrderId = result.OrderId,
+                            Side = side,
+                            Price = price,
+                            Quantity = qty,
+                            Status = OrderStatus.Opened,
+                            Role = OrderRole.Entry
+                        });
+                        log($"[Order Placed] Server ID: {result.OrderId}.", StrategyLoggingLevel.Trading);
+                    }
+                    else
+                    {
+                        consecutiveOrderFailures++;
+                        log($"[Order Failed] {result.Message} (Consecutive failures: {consecutiveOrderFailures})", StrategyLoggingLevel.Error);
+                        if (consecutiveOrderFailures >= cfg.MaxConsecutiveFailures)
+                            Halt($"{consecutiveOrderFailures} consecutive order placement failures");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    consecutiveOrderFailures++;
+                    log($"[Order Placement Exception] {ex.Message} (Consecutive failures: {consecutiveOrderFailures})", StrategyLoggingLevel.Error);
+                    if (consecutiveOrderFailures >= cfg.MaxConsecutiveFailures)
+                        Halt($"{consecutiveOrderFailures} consecutive order placement failures (exception path)");
+                }
+                finally
+                {
+                    isOrderPlacementPending = false;
+                }
+                return Task.CompletedTask;
+            }, 2, TaskCategory.EntryPlacement);
         }
 
         // ===================== C-07: bracket placement + protection invariant =====================

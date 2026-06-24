@@ -139,6 +139,10 @@ namespace MBO_Market_Data_Analytics
 
         private AnalyticsEngineHost? engine;
 
+        // Outbound broker seam (C-06..C-09 testability). All order placement/modify/cancel/position
+        // queries route through this so the execution logic can be driven by a fake broker in tests.
+        private IBroker? broker;
+
         // Phase 1 adaptive controller (null in Static mode)
         private AdaptiveParameterController? adaptiveController;
         // Phase 2: last known polarity — used to detect transitions and reset signal state
@@ -248,6 +252,9 @@ namespace MBO_Market_Data_Analytics
             this.CurrentAccount = Core.Instance.Accounts.FirstOrDefault(a => a.Id == accountInfo.Id) ?? this.CurrentAccount;
 
             Log($"Initializing DataAnalyticsStrategy for Symbol: {CurrentSymbol.Name}, Account: {CurrentAccount.Name}", StrategyLoggingLevel.Info);
+
+            // Build the live broker adapter over the resolved symbol/account.
+            broker = new QuantowerBroker(CurrentSymbol, CurrentAccount);
 
             isRiskHalted = false;
             strategyRealizedPnL = 0.0;
@@ -387,33 +394,19 @@ namespace MBO_Market_Data_Analytics
             foreach (var kv in trackedOrders)
             {
                 var state = kv.Value;
-                if (state.OrderInstance != null &&
+                if (state.OrderId != null &&
                     (state.Status == OrderStatus.Opened || state.Status == OrderStatus.PartiallyFilled))
                 {
-                    try { state.OrderInstance.Cancel(); }
+                    try { broker?.Cancel(state.OrderId); }
                     catch (Exception ex) { Log($"[OnStop] Order cancel failed: {ex.Message}", StrategyLoggingLevel.Error); }
                 }
             }
             double stopPosSize = GetBrokerPositionSize();
-            if (stopPosSize != 0.0 && CurrentSymbol != null && CurrentAccount != null)
+            if (stopPosSize != 0.0 && broker != null)
             {
                 Log($"[OnStop] Flattening open position ({stopPosSize:+0.##;-0.##} contracts) on strategy stop.", StrategyLoggingLevel.Error);
                 Side flatSide = stopPosSize > 0.0 ? Side.Sell : Side.Buy;
-                var mktType = CurrentSymbol.GetAlowedOrderTypes(OrderTypeUsage.Order)
-                                 .FirstOrDefault(ot => ot.Behavior == OrderTypeBehavior.Market) ??
-                             CurrentSymbol.GetAlowedOrderTypes(OrderTypeUsage.All)
-                                 .FirstOrDefault(ot => ot.Behavior == OrderTypeBehavior.Market);
-                try
-                {
-                    Core.Instance.PlaceOrder(new PlaceOrderRequestParameters
-                    {
-                        Symbol = CurrentSymbol,
-                        Account = CurrentAccount,
-                        Side = flatSide,
-                        OrderTypeId = mktType?.Id ?? OrderType.Market,
-                        Quantity = Math.Abs(stopPosSize)
-                    });
-                }
+                try { broker.PlaceMarketClose(flatSide, Math.Abs(stopPosSize), ""); }
                 catch (Exception ex) { Log($"[OnStop] Market flatten failed: {ex.Message}", StrategyLoggingLevel.Error); }
             }
 
@@ -833,9 +826,9 @@ namespace MBO_Market_Data_Analytics
                 {
                     foreach (var oe in opposite)
                     {
-                        var ord = oe.OrderInstance;
-                        if (ord != null)
-                            prioritizedQueue?.Enqueue(() => { ord.Cancel(); return Task.CompletedTask; }, 1, TaskCategory.Protection);
+                        string? oid = oe.OrderId;
+                        if (oid != null)
+                            prioritizedQueue?.Enqueue(() => { broker?.Cancel(oid); return Task.CompletedTask; }, 1, TaskCategory.Protection);
                     }
                     Log($"[Entry Policy] Opposite-side working entry present; cancelling it before a {side} entry.", StrategyLoggingLevel.Trading);
                     // Reset this side's signal latch so the entry re-fires on the next qualifying tick,
@@ -940,31 +933,11 @@ namespace MBO_Market_Data_Analytics
 
             prioritizedQueue?.Enqueue(() =>
             {
-                // Resolve limit order type dynamically from the symbol allowed types
-                var limitType = CurrentSymbol?.GetAlowedOrderTypes(OrderTypeUsage.Order)
-                                   .FirstOrDefault(ot => ot.Behavior == OrderTypeBehavior.Limit) ??
-                               CurrentSymbol?.GetAlowedOrderTypes(OrderTypeUsage.All)
-                                   .FirstOrDefault(ot => ot.Behavior == OrderTypeBehavior.Limit);
-                string orderTypeId = limitType?.Id ?? OrderType.Limit;
-
-                // Place limit order
-                var request = new PlaceOrderRequestParameters
-                {
-                    Symbol = CurrentSymbol,
-                    Account = CurrentAccount,
-                    Side = side,
-                    OrderTypeId = orderTypeId,
-                    Price = price,
-                    Quantity = qty,
-                    Comment = EntryComment()
-                };
-                
                 try
                 {
-                    // Omit REDUCE_ONLY and POST_ONLY as they are unsupported by IB
-                    var result = Core.Instance.PlaceOrder(request);
-                    
-                    if (result.Status == TradingOperationResultStatus.Success)
+                    var result = broker!.PlaceEntryLimit(side, price, qty, EntryComment());
+
+                    if (result.Success)
                     {
                         consecutiveOrderFailures = 0; // Reset counter on successful placement
                         trackedOrders[result.OrderId] = new TrackedOrderState
@@ -1079,13 +1052,13 @@ namespace MBO_Market_Data_Analytics
             // 1. Cancel all working orders in the prioritized queue (priority 0)
             foreach (var trackedOrder in trackedOrders.Values)
             {
-                if (trackedOrder.OrderInstance != null &&
+                if (trackedOrder.OrderId != null &&
                     (trackedOrder.Status == OrderStatus.Opened || trackedOrder.Status == OrderStatus.PartiallyFilled))
                 {
-                    var ord = trackedOrder.OrderInstance;
+                    string oid = trackedOrder.OrderId;
                     prioritizedQueue?.Enqueue(() =>
                     {
-                        ord.Cancel();
+                        broker?.Cancel(oid);
                         return Task.CompletedTask;
                     }, 0, TaskCategory.Flatten);
                 }
@@ -1106,22 +1079,9 @@ namespace MBO_Market_Data_Analytics
                 double qty = Math.Abs(posSize);
                 Log($"[Flatten Placement] Generation {gen}: Market {flatSide} for {qty} contracts.", StrategyLoggingLevel.Info);
 
-                var marketType = CurrentSymbol?.GetAlowedOrderTypes(OrderTypeUsage.Order)
-                                    .FirstOrDefault(ot => ot.Behavior == OrderTypeBehavior.Market) ??
-                                CurrentSymbol?.GetAlowedOrderTypes(OrderTypeUsage.All)
-                                    .FirstOrDefault(ot => ot.Behavior == OrderTypeBehavior.Market);
-                string orderTypeId = marketType?.Id ?? OrderType.Market;
+                var flatResult = broker!.PlaceMarketClose(flatSide, qty, "");
 
-                var flatResult = Core.Instance.PlaceOrder(new PlaceOrderRequestParameters
-                {
-                    Symbol = CurrentSymbol,
-                    Account = CurrentAccount,
-                    Side = flatSide,
-                    OrderTypeId = orderTypeId,
-                    Quantity = qty
-                });
-
-                if (flatResult.Status != TradingOperationResultStatus.Success)
+                if (!flatResult.Success)
                 {
                     // C-08: the close was not accepted — release the in-flight guard so a subsequent
                     // event can retry, rather than leaving the position stuck with flattenInFlight=true.
@@ -1133,11 +1093,7 @@ namespace MBO_Market_Data_Analytics
             }, 1, TaskCategory.Flatten);
         }
 
-        private double GetBrokerPositionSize()
-        {
-            var pos = Core.Instance.Positions.FirstOrDefault(p => p.Symbol?.Id == CurrentSymbol.Id && p.Account?.Id == CurrentAccount.Id);
-            return pos != null ? (pos.Side == Side.Buy ? pos.Quantity : -pos.Quantity) : 0.0;
-        }
+        private double GetBrokerPositionSize() => broker?.GetNetPositionSize() ?? 0.0;
 
         // -----------------------------------------------------
         // Order Lifecycle & Reconciliation
@@ -1331,14 +1287,14 @@ namespace MBO_Market_Data_Analytics
                 // Position went flat, cancel all active bracket orders
                 foreach (var trackedOrder in trackedOrders.Values)
                 {
-                    if (trackedOrder.Role == OrderRole.Bracket && trackedOrder.OrderInstance != null &&
+                    if (trackedOrder.Role == OrderRole.Bracket && trackedOrder.OrderId != null &&
                         (trackedOrder.Status == OrderStatus.Opened || trackedOrder.Status == OrderStatus.PartiallyFilled))
                     {
-                        var ord = trackedOrder.OrderInstance;
-                        Log($"[OCO Action] Position flat. Cancelling bracket order {ord.Id}.", StrategyLoggingLevel.Trading);
+                        string oid = trackedOrder.OrderId;
+                        Log($"[OCO Action] Position flat. Cancelling bracket order {oid}.", StrategyLoggingLevel.Trading);
                         prioritizedQueue?.Enqueue(() =>
                         {
-                            ord.Cancel();
+                            broker?.Cancel(oid);
                             return Task.CompletedTask;
                         }, 0, TaskCategory.Protection);
                     }
@@ -1369,12 +1325,7 @@ namespace MBO_Market_Data_Analytics
 
                     slPrice = Math.Round(slPrice / tickSize) * tickSize;
 
-                    var stopOrderType = CurrentSymbol.GetAlowedOrderTypes(OrderTypeUsage.CloseOrder)
-                        .FirstOrDefault(ot => ot.Behavior == OrderTypeBehavior.Stop) ?? 
-                        CurrentSymbol.GetAlowedOrderTypes(OrderTypeUsage.All)
-                        .FirstOrDefault(ot => ot.Behavior == OrderTypeBehavior.Stop);
-
-                    if (stopOrderType == null)
+                    if (!broker!.HasStopOrderType)
                     {
                         // C-07: no stop order type available means the position would be NAKED. Do not
                         // silently fall through to TP placement — halt and flatten.
@@ -1385,18 +1336,9 @@ namespace MBO_Market_Data_Analytics
 
                     Log($"[Bracket SL] Scheduling SL Stop order on {bracketSide} at {slPrice} for quantity {qty}.", StrategyLoggingLevel.Trading);
 
-                    var slResult = Core.Instance.PlaceOrder(new PlaceOrderRequestParameters
-                    {
-                        Symbol = CurrentSymbol,
-                        Account = CurrentAccount,
-                        Side = bracketSide,
-                        OrderTypeId = stopOrderType.Id,
-                        TriggerPrice = slPrice,
-                        Quantity = qty,
-                        Comment = BracketComment()
-                    });
+                    var slResult = broker!.PlaceProtectiveStop(bracketSide, slPrice, qty, BracketComment());
 
-                    if (slResult.Status == TradingOperationResultStatus.Success)
+                    if (slResult.Success)
                     {
                         trackedOrders[slResult.OrderId] = new TrackedOrderState
                         {
@@ -1430,24 +1372,9 @@ namespace MBO_Market_Data_Analytics
 
                     Log($"[Bracket TP] Scheduling TP Limit order on {bracketSide} at {tpPrice} for quantity {qty}.", StrategyLoggingLevel.Trading);
 
-                    var limitType = CurrentSymbol?.GetAlowedOrderTypes(OrderTypeUsage.CloseOrder)
-                                       .FirstOrDefault(ot => ot.Behavior == OrderTypeBehavior.Limit) ??
-                                   CurrentSymbol?.GetAlowedOrderTypes(OrderTypeUsage.All)
-                                       .FirstOrDefault(ot => ot.Behavior == OrderTypeBehavior.Limit);
-                    string limitTypeId = limitType?.Id ?? OrderType.Limit;
+                    var tpResult = broker!.PlaceProtectiveLimit(bracketSide, tpPrice, qty, BracketComment());
 
-                    var tpResult = Core.Instance.PlaceOrder(new PlaceOrderRequestParameters
-                    {
-                        Symbol = CurrentSymbol,
-                        Account = CurrentAccount,
-                        Side = bracketSide,
-                        OrderTypeId = limitTypeId,
-                        Price = tpPrice,
-                        Quantity = qty,
-                        Comment = BracketComment()
-                    });
-
-                    if (tpResult.Status == TradingOperationResultStatus.Success)
+                    if (tpResult.Success)
                     {
                         trackedOrders[tpResult.OrderId] = new TrackedOrderState
                         {
@@ -1560,13 +1487,13 @@ namespace MBO_Market_Data_Analytics
                     double remainingOrderQty = state.Quantity - state.FilledQuantity;
                     if (remainingOrderQty <= excess)
                     {
-                        var ord = state.OrderInstance;
-                        if (ord != null)
+                        if (state.OrderId != null)
                         {
-                            Log($"[Bracket Adjust] Cancelling bracket order {ord.Id}.", StrategyLoggingLevel.Trading);
+                            string oid = state.OrderId;
+                            Log($"[Bracket Adjust] Cancelling bracket order {oid}.", StrategyLoggingLevel.Trading);
                             prioritizedQueue?.Enqueue(() =>
                             {
-                                ord.Cancel();
+                                broker?.Cancel(oid);
                                 return Task.CompletedTask;
                             }, 0, TaskCategory.Protection);
                         }
@@ -1574,28 +1501,22 @@ namespace MBO_Market_Data_Analytics
                     }
                     else
                     {
-                        var ord = state.OrderInstance;
-                        if (ord != null)
+                        if (state.OrderId != null)
                         {
-                            // H-11: ModifyOrderRequestParameters.Quantity is the order's TOTAL quantity,
-                            // not the remaining. For a partially filled order, set total = filled +
-                            // desired remaining; assigning the desired remaining alone under-sizes it.
+                            // H-11: the modify quantity is the order's TOTAL, not the remaining. For a
+                            // partially filled order, set total = filled + desired remaining; assigning
+                            // the desired remaining alone under-sizes it.
                             double desiredRemaining = remainingOrderQty - excess;
                             double newTotal = state.FilledQuantity + desiredRemaining;
-                            string ordId = ord.Id;
+                            string ordId = state.OrderId;
                             Log($"[Bracket Adjust] Modifying bracket {ordId}: remaining {remainingOrderQty} -> {desiredRemaining} (total qty -> {newTotal}).", StrategyLoggingLevel.Trading);
                             prioritizedQueue?.Enqueue(() =>
                             {
-                                var modifyParams = new ModifyOrderRequestParameters(ord)
-                                {
-                                    Quantity = newTotal
-                                };
-                                var modResult = Core.Instance.ModifyOrder(modifyParams);
-                                if (modResult.Status == TradingOperationResultStatus.Success)
+                                var modResult = broker!.ModifyQuantity(ordId, newTotal);
+                                if (modResult.Success)
                                 {
                                     // Refresh tracked total so the protection invariant and future
-                                    // adjustments use the new size. The Updated event will reconcile
-                                    // against Order.TotalQuantity/RemainingQuantity as well.
+                                    // adjustments use the new size. The Updated event reconciles too.
                                     if (trackedOrders.TryGetValue(ordId, out var cur))
                                         trackedOrders[ordId] = cur with { Quantity = newTotal };
                                 }

@@ -14,9 +14,9 @@ namespace MBO_Market_Data_Analytics.Tests
             var broker = new FakeBroker();
             var sched = new FakeScheduler(); // auto-run
             var roundTrips = new List<double>();
+            // Default getBracketTicks => (0,0): entry fills place no brackets, isolating position math.
             var core = new ExecutionCore(broker, sched, (_, __) => { }, new ExecConfig { PointCost = pointCost },
-                onRoundTripClosed: pnl => roundTrips.Add(pnl),
-                onEntryFilled: (_, __, ___) => { });
+                onRoundTripClosed: pnl => roundTrips.Add(pnl));
             core.SetRunning();
             return (core, broker, roundTrips);
         }

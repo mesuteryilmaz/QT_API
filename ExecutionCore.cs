@@ -37,10 +37,10 @@ namespace MBO_Market_Data_Analytics
         private readonly IExecScheduler scheduler;
         private readonly Action<string, StrategyLoggingLevel> log;
         private readonly ExecConfig cfg;
-        // Round-trip realized PnL (for the strategy's promotion tracker) and entry-fill notification
-        // (the strategy attaches protective brackets — that placement logic is the next slice).
+        // Round-trip realized PnL callback (for the strategy's promotion tracker) and the effective
+        // bracket distances (TP/SL ticks), which the strategy derives from its adaptive controller.
         private readonly Action<double> onRoundTripClosed;
-        private readonly Action<Side, double, double> onEntryFilled;
+        private readonly Func<(int tp, int sl)> getBracketTicks;
 
         private readonly ConcurrentDictionary<string, TrackedOrderState> trackedOrders = new();
         private readonly object lifecycleLock = new();
@@ -56,19 +56,25 @@ namespace MBO_Market_Data_Analytics
         private int flattenGeneration;
         private volatile bool flattenInFlight;
         private volatile bool isRiskHalted;
+        private int consecutiveOrderFailures;
+
+        /// <summary>Per-run id embedded in placed-order comments (set by the strategy adapter).</summary>
+        public string RunId = "";
 
         public ExecutionCore(IBroker broker, IExecScheduler scheduler,
                              Action<string, StrategyLoggingLevel> log, ExecConfig cfg,
                              Action<double>? onRoundTripClosed = null,
-                             Action<Side, double, double>? onEntryFilled = null)
+                             Func<(int tp, int sl)>? getBracketTicks = null)
         {
             this.broker = broker ?? throw new ArgumentNullException(nameof(broker));
             this.scheduler = scheduler ?? throw new ArgumentNullException(nameof(scheduler));
             this.log = log ?? ((_, __) => { });
             this.cfg = cfg ?? new ExecConfig();
             this.onRoundTripClosed = onRoundTripClosed ?? (_ => { });
-            this.onEntryFilled = onEntryFilled ?? ((_, __, ___) => { });
+            this.getBracketTicks = getBracketTicks ?? (() => (0, 0));
         }
+
+        private string BracketComment() => $"MBO:BRK|{RunId}";
 
         // ---- read-only state (consumed by the strategy's signal layer and by tests) ----
         public StrategyLifecycleState Lifecycle => lifecycle;
@@ -139,8 +145,8 @@ namespace MBO_Market_Data_Analytics
 
                 if (state.Role == OrderRole.Entry)
                 {
-                    // Our own signal entry — attach protective brackets (placement is the next slice).
-                    onEntryFilled(snap.Side, marginalPrice, filledDiff);
+                    // Our own signal entry — attach protective brackets.
+                    ManageBracketsForFill(snap.Side, marginalPrice, filledDiff);
                 }
                 else if (state.Role == OrderRole.Bracket && wasFlatBefore)
                 {
@@ -298,6 +304,127 @@ namespace MBO_Market_Data_Analytics
                     }, 1, TaskCategory.Protection);
                     excess = 0;
                 }
+            }
+        }
+
+        // ===================== C-07: bracket placement + protection invariant =====================
+
+        private void ManageBracketsForFill(Side entrySide, double fillPrice, double qty)
+        {
+            var (tpTicks, slTicks) = getBracketTicks();
+            if (slTicks <= 0 && tpTicks <= 0) return;
+
+            Side bracketSide = entrySide == Side.Buy ? Side.Sell : Side.Buy;
+            double tickSize = cfg.TickSize;
+
+            scheduler.Post(() =>
+            {
+                if (slTicks > 0)
+                {
+                    double slPrice = entrySide == Side.Buy
+                        ? fillPrice - (slTicks * tickSize)
+                        : fillPrice + (slTicks * tickSize);
+                    slPrice = Math.Round(slPrice / tickSize) * tickSize;
+
+                    if (!broker.HasStopOrderType)
+                    {
+                        // C-07: no stop order type means the position would be NAKED. Do not fall
+                        // through to TP placement — halt and flatten.
+                        log($"[Risk Limit] No Stop order type available. Cannot protect position — halting and flattening.", StrategyLoggingLevel.Error);
+                        Halt("no stop order type available (naked position)");
+                        return Task.CompletedTask;
+                    }
+
+                    log($"[Bracket SL] Scheduling SL Stop on {bracketSide} at {slPrice} for {qty}.", StrategyLoggingLevel.Trading);
+                    var slResult = broker.PlaceProtectiveStop(bracketSide, slPrice, qty, BracketComment());
+                    if (slResult.Success)
+                    {
+                        Track(new TrackedOrderState
+                        {
+                            LocalId = Guid.NewGuid().ToString(),
+                            OrderId = slResult.OrderId,
+                            Side = bracketSide,
+                            Price = slPrice,
+                            Quantity = qty,
+                            Status = OrderStatus.Opened,
+                            Role = OrderRole.Bracket,
+                            IsStopHint = true
+                        });
+                    }
+                    else
+                    {
+                        log($"[Risk Limit] SL placement failed: {slResult.Message}. Flattening — position has no stop.", StrategyLoggingLevel.Error);
+                        Halt($"stop-loss placement failed ({slResult.Message})");
+                        return Task.CompletedTask; // no point protecting upside without a stop
+                    }
+                }
+
+                if (tpTicks > 0)
+                {
+                    double tpPrice = entrySide == Side.Buy
+                        ? fillPrice + (tpTicks * tickSize)
+                        : fillPrice - (tpTicks * tickSize);
+                    tpPrice = Math.Round(tpPrice / tickSize) * tickSize;
+
+                    log($"[Bracket TP] Scheduling TP Limit on {bracketSide} at {tpPrice} for {qty}.", StrategyLoggingLevel.Trading);
+                    var tpResult = broker.PlaceProtectiveLimit(bracketSide, tpPrice, qty, BracketComment());
+                    if (tpResult.Success)
+                    {
+                        Track(new TrackedOrderState
+                        {
+                            LocalId = Guid.NewGuid().ToString(),
+                            OrderId = tpResult.OrderId,
+                            Side = bracketSide,
+                            Price = tpPrice,
+                            Quantity = qty,
+                            Status = OrderStatus.Opened,
+                            Role = OrderRole.Bracket,
+                            IsStopHint = false
+                        });
+                    }
+                    else
+                    {
+                        log($"[Bracket TP] Placement failed: {tpResult.Message}", StrategyLoggingLevel.Error);
+                        consecutiveOrderFailures++;
+                        if (consecutiveOrderFailures >= cfg.MaxConsecutiveFailures)
+                        {
+                            log($"[Risk Limit] Halted due to bracket TP placement failure.", StrategyLoggingLevel.Error);
+                            Halt("bracket TP placement failure");
+                        }
+                    }
+                }
+
+                // C-07: confirm the position is now covered by a working stop before finishing.
+                VerifyProtectionInvariant($"after brackets for {entrySide} fill");
+                return Task.CompletedTask;
+            }, 1, TaskCategory.Protection);
+        }
+
+        /// <summary>
+        /// C-07: enforce "working stop remaining qty >= |position|". Call after fills/bracket placement
+        /// and after reconnect. If an open position is not covered by a working stop, halt + flatten.
+        /// Gated on slTicks &gt; 0 so a deliberately stop-less configuration is unaffected.
+        /// </summary>
+        public void VerifyProtectionInvariant(string context)
+        {
+            var (_, slTicks) = getBracketTicks();
+            if (slTicks <= 0) return;
+
+            double pos;
+            lock (stateLock) { pos = currentPositionSize; }
+            double absPos = Math.Abs(pos);
+            if (absPos <= 1e-9) return;
+
+            Side closeSide = pos > 0 ? Side.Sell : Side.Buy;
+            double stopCover = trackedOrders.Values
+                .Where(o => o.Role == OrderRole.Bracket && o.Side == closeSide && IsWorkingStop(o) &&
+                            (o.Status == OrderStatus.Opened || o.Status == OrderStatus.PartiallyFilled))
+                .Sum(o => o.Quantity - o.FilledQuantity);
+
+            if (stopCover + 1e-9 < absPos)
+            {
+                log($"[Protection] Invariant violated ({context}): working stop cover {stopCover} < position {absPos}. Halting and flattening.", StrategyLoggingLevel.Error);
+                Halt($"stop cover {stopCover} < position {absPos}");
             }
         }
 

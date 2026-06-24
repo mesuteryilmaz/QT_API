@@ -363,8 +363,12 @@ namespace MBO_Market_Data_Analytics
             // (EvaluateTradingSignal) cannot fire until Start() is called.
             engine.Start();
 
-            // C-08: all state is ready — enter Running so entry generation is enabled.
-            TransitionTo(StrategyLifecycleState.Running, "initialization complete");
+            // C-07: a restored position with no working stop must not resume unprotected.
+            VerifyProtectionInvariant("initial reconcile");
+
+            // C-08: enter Running only if the initial protection check did not halt us.
+            if (!isRiskHalted)
+                TransitionTo(StrategyLifecycleState.Running, "initialization complete");
         }
 
         protected override void OnStop()
@@ -1209,38 +1213,32 @@ namespace MBO_Market_Data_Analytics
                     double filledDiff = newFilled - oldFilled;
                     Log($"[Fill Alert] Order {ord.Id} filled: {oldFilled} -> {newFilled} (Diff: {filledDiff})", StrategyLoggingLevel.Trading);
 
-                    // OCO guard: if a bracket (SL or TP) fills after the position is already flat,
-                    // the sibling bracket closed it first. Processing this fill would open a new
-                    // position in the opposite direction. Reject it and cancel the order.
-                    bool rejectFill = false;
-                    if (state.Role == OrderRole.Bracket)
+                    // M-12: AverageFillPrice is cumulative; derive the marginal price for this increment.
+                    double marginalPrice = (oldFilled <= 0 || oldCumAvg <= 0)
+                        ? newCumAvg
+                        : (newFilled * newCumAvg - oldFilled * oldCumAvg) / filledDiff;
+                    if (marginalPrice <= 0) marginalPrice = state.Price;
+
+                    // C-06: a broker fill is FINAL and cannot be cancelled — never "reject" it. Apply it
+                    // to local state (broker truth wins), then handle the consequences.
+                    bool wasFlatBefore;
+                    lock (stateLock) { wasFlatBefore = currentPositionSize == 0.0; }
+
+                    ProcessExecutionFill(ord.Side, marginalPrice, filledDiff);
+
+                    if (state.Role == OrderRole.Entry)
                     {
-                        lock (stateLock) { rejectFill = currentPositionSize == 0.0; }
-                        if (rejectFill)
-                        {
-                            Log($"[OCO Guard] Bracket {ord.Id} filled after position was already flat — rejecting to prevent reversal.", StrategyLoggingLevel.Error);
-                            var ordRefOco = ord;
-                            prioritizedQueue?.Enqueue(() => { ordRefOco.Cancel(); return Task.CompletedTask; }, 0, TaskCategory.Protection);
-                        }
+                        // Our own signal entry — attach protective brackets.
+                        ManageBracketsForFill(ord.Side, marginalPrice, filledDiff);
                     }
-
-                    if (!rejectFill)
+                    else if (state.Role == OrderRole.Bracket && wasFlatBefore)
                     {
-                        // M-12: AverageFillPrice is cumulative; derive the marginal price for this increment
-                        double marginalPrice = (oldFilled <= 0 || oldCumAvg <= 0)
-                            ? newCumAvg
-                            : (newFilled * newCumAvg - oldFilled * oldCumAvg) / filledDiff;
-                        if (marginalPrice <= 0) marginalPrice = state.Price;
-
-                        ProcessExecutionFill(ord.Side, marginalPrice, filledDiff);
-
-                        // Only our own signal entries spawn protective brackets. Bracket fills and
-                        // reconciled (post-reconnect, role-unknown) orders must NOT spawn new brackets,
-                        // otherwise a TP/SL fill after a reconnect would cascade into fresh orders.
-                        if (state.Role == OrderRole.Entry)
-                        {
-                            ManageBracketsForFill(ord.Side, marginalPrice, filledDiff);
-                        }
+                        // C-06: a protective bracket filled while we were already flat — its sibling had
+                        // closed the position first, so this final fill just opened a REVERSED position.
+                        // State is already reconciled above; now halt + flatten (which cancels the
+                        // sibling) instead of the old behaviour of "rejecting" an unrejectable fill.
+                        Log($"[OCO] Bracket {ord.Id} filled while already flat — broker opened a reversed position. Halting and flattening.", StrategyLoggingLevel.Error);
+                        Halt($"late bracket fill reversed position (order {ord.Id})");
                     }
                 }
 
@@ -1352,42 +1350,49 @@ namespace MBO_Market_Data_Analytics
                         CurrentSymbol.GetAlowedOrderTypes(OrderTypeUsage.All)
                         .FirstOrDefault(ot => ot.Behavior == OrderTypeBehavior.Stop);
 
-                    if (stopOrderType != null)
+                    if (stopOrderType == null)
                     {
-                        Log($"[Bracket SL] Scheduling SL Stop order on {bracketSide} at {slPrice} for quantity {qty}.", StrategyLoggingLevel.Trading);
+                        // C-07: no stop order type available means the position would be NAKED. Do not
+                        // silently fall through to TP placement — halt and flatten.
+                        Log($"[Risk Limit] No Stop order type available on {CurrentSymbol.Name}. Cannot protect position — halting and flattening.", StrategyLoggingLevel.Error);
+                        Halt("no stop order type available (naked position)");
+                        return Task.CompletedTask;
+                    }
 
-                        var slResult = Core.Instance.PlaceOrder(new PlaceOrderRequestParameters
+                    Log($"[Bracket SL] Scheduling SL Stop order on {bracketSide} at {slPrice} for quantity {qty}.", StrategyLoggingLevel.Trading);
+
+                    var slResult = Core.Instance.PlaceOrder(new PlaceOrderRequestParameters
+                    {
+                        Symbol = CurrentSymbol,
+                        Account = CurrentAccount,
+                        Side = bracketSide,
+                        OrderTypeId = stopOrderType.Id,
+                        TriggerPrice = slPrice,
+                        Quantity = qty,
+                        Comment = BracketComment()
+                    });
+
+                    if (slResult.Status == TradingOperationResultStatus.Success)
+                    {
+                        trackedOrders[slResult.OrderId] = new TrackedOrderState
                         {
-                            Symbol = CurrentSymbol,
-                            Account = CurrentAccount,
+                            LocalId = Guid.NewGuid().ToString(),
+                            OrderId = slResult.OrderId,
                             Side = bracketSide,
-                            OrderTypeId = stopOrderType.Id,
-                            TriggerPrice = slPrice,
+                            Price = slPrice,
                             Quantity = qty,
-                            Comment = BracketComment()
-                        });
-
-                        if (slResult.Status == TradingOperationResultStatus.Success)
-                        {
-                            trackedOrders[slResult.OrderId] = new TrackedOrderState
-                            {
-                                LocalId = Guid.NewGuid().ToString(),
-                                OrderId = slResult.OrderId,
-                                Side = bracketSide,
-                                Price = slPrice,
-                                Quantity = qty,
-                                Status = OrderStatus.Opened,
-                                Role = OrderRole.Bracket
-                            };
-                        }
-                        else
-                        {
-                            // A missing SL means the position has no downside protection.
-                            // Flatten immediately regardless of consecutive-failure count.
-                            Log($"[Risk Limit] SL placement failed: {slResult.Message}. Flattening — open position has no stop loss.", StrategyLoggingLevel.Error);
-                            Halt($"stop-loss placement failed ({slResult.Message})");
-                            return Task.CompletedTask; // skip TP placement — no point protecting upside without a stop
-                        }
+                            Status = OrderStatus.Opened,
+                            Role = OrderRole.Bracket,
+                            IsStopHint = true // C-07: known stop, even before OnCoreOrderAdded links it
+                        };
+                    }
+                    else
+                    {
+                        // A missing SL means the position has no downside protection.
+                        // Flatten immediately regardless of consecutive-failure count.
+                        Log($"[Risk Limit] SL placement failed: {slResult.Message}. Flattening — open position has no stop loss.", StrategyLoggingLevel.Error);
+                        Halt($"stop-loss placement failed ({slResult.Message})");
+                        return Task.CompletedTask; // skip TP placement — no point protecting upside without a stop
                     }
                 }
 
@@ -1428,7 +1433,8 @@ namespace MBO_Market_Data_Analytics
                             Price = tpPrice,
                             Quantity = qty,
                             Status = OrderStatus.Opened,
-                            Role = OrderRole.Bracket
+                            Role = OrderRole.Bracket,
+                            IsStopHint = false // C-07: known take-profit limit
                         };
                     }
                     else
@@ -1442,8 +1448,39 @@ namespace MBO_Market_Data_Analytics
                         }
                     }
                 }
+
+                // C-07: confirm the position is now covered by a working stop before finishing.
+                VerifyProtectionInvariant($"after brackets for {entrySide} fill");
                 return Task.CompletedTask;
-            }, 2, TaskCategory.Protection); // C-07: priority elevation above entries lands in Step 4
+            }, 1, TaskCategory.Protection); // C-07: protection placed at priority 1 — above entries (2)
+        }
+
+        // C-07: enforce "working owned stop remaining qty >= |owned position qty|". Call after every
+        // fill/bracket placement and after reconnect reconciliation. If the open position is not
+        // covered by a working stop, halt and flatten rather than run unprotected.
+        private void VerifyProtectionInvariant(string context)
+        {
+            // Only enforce when the strategy is configured to use a stop. If the operator set SL=0
+            // (and the adaptive controller likewise yields no stop), they have opted out of stops.
+            var (_, slTicks) = GetEffectiveBracketTicks();
+            if (slTicks <= 0) return;
+
+            double pos;
+            lock (stateLock) { pos = currentPositionSize; }
+            double absPos = Math.Abs(pos);
+            if (absPos <= 1e-9) return; // flat — nothing to protect
+
+            Side closeSide = pos > 0 ? Side.Sell : Side.Buy;
+            double stopCover = trackedOrders.Values
+                .Where(o => o.Role == OrderRole.Bracket && o.Side == closeSide && IsWorkingStop(o) &&
+                            (o.Status == OrderStatus.Opened || o.Status == OrderStatus.PartiallyFilled))
+                .Sum(o => o.Quantity - o.FilledQuantity);
+
+            if (stopCover + 1e-9 < absPos)
+            {
+                Log($"[Protection] Invariant violated ({context}): working stop cover {stopCover} < position {absPos}. Halting and flattening.", StrategyLoggingLevel.Error);
+                Halt($"stop cover {stopCover} < position {absPos}");
+            }
         }
 
         private void ReconcileBracketQuantities()
@@ -1452,11 +1489,11 @@ namespace MBO_Market_Data_Analytics
 
             var activeSLs = trackedOrders.Values.Where(o => o.Role == OrderRole.Bracket &&
                                                             (o.Status == OrderStatus.Opened || o.Status == OrderStatus.PartiallyFilled) &&
-                                                            IsStopOrder(o.OrderInstance)).ToList();
+                                                            IsWorkingStop(o)).ToList();
 
             var activeTPs = trackedOrders.Values.Where(o => o.Role == OrderRole.Bracket &&
                                                             (o.Status == OrderStatus.Opened || o.Status == OrderStatus.PartiallyFilled) &&
-                                                            IsLimitOrder(o.OrderInstance)).ToList();
+                                                            IsWorkingLimit(o)).ToList();
 
             AdjustBracketGroup(activeSLs, absPosition);
             AdjustBracketGroup(activeTPs, absPosition);
@@ -1475,6 +1512,12 @@ namespace MBO_Market_Data_Analytics
             var ot = Core.Instance.GetOrderType(order.OrderTypeId);
             return ot != null && ot.Behavior == OrderTypeBehavior.Limit;
         }
+
+        // C-07: classify a tracked bracket as stop/limit using the placement hint first (works before
+        // OnCoreOrderAdded links OrderInstance), falling back to the linked order's type for
+        // reconciled brackets where the hint is unknown.
+        private bool IsWorkingStop(TrackedOrderState s) => s.IsStopHint ?? IsStopOrder(s.OrderInstance);
+        private bool IsWorkingLimit(TrackedOrderState s) => (s.IsStopHint == false) || (s.IsStopHint == null && IsLimitOrder(s.OrderInstance));
 
         private void AdjustBracketGroup(List<TrackedOrderState> brackets, double targetQty)
         {
@@ -1510,15 +1553,32 @@ namespace MBO_Market_Data_Analytics
                         var ord = state.OrderInstance;
                         if (ord != null)
                         {
-                            double newQty = remainingOrderQty - excess;
-                            Log($"[Bracket Adjust] Modifying bracket order {ord.Id} quantity to {newQty}.", StrategyLoggingLevel.Trading);
+                            // H-11: ModifyOrderRequestParameters.Quantity is the order's TOTAL quantity,
+                            // not the remaining. For a partially filled order, set total = filled +
+                            // desired remaining; assigning the desired remaining alone under-sizes it.
+                            double desiredRemaining = remainingOrderQty - excess;
+                            double newTotal = state.FilledQuantity + desiredRemaining;
+                            string ordId = ord.Id;
+                            Log($"[Bracket Adjust] Modifying bracket {ordId}: remaining {remainingOrderQty} -> {desiredRemaining} (total qty -> {newTotal}).", StrategyLoggingLevel.Trading);
                             prioritizedQueue?.Enqueue(() =>
                             {
                                 var modifyParams = new ModifyOrderRequestParameters(ord)
                                 {
-                                    Quantity = newQty
+                                    Quantity = newTotal
                                 };
-                                Core.Instance.ModifyOrder(modifyParams);
+                                var modResult = Core.Instance.ModifyOrder(modifyParams);
+                                if (modResult.Status == TradingOperationResultStatus.Success)
+                                {
+                                    // Refresh tracked total so the protection invariant and future
+                                    // adjustments use the new size. The Updated event will reconcile
+                                    // against Order.TotalQuantity/RemainingQuantity as well.
+                                    if (trackedOrders.TryGetValue(ordId, out var cur))
+                                        trackedOrders[ordId] = cur with { Quantity = newTotal };
+                                }
+                                else
+                                {
+                                    Log($"[Bracket Adjust] Modify of {ordId} failed: {modResult.Message}.", StrategyLoggingLevel.Error);
+                                }
                                 return Task.CompletedTask;
                             }, 1, TaskCategory.Protection);
                         }
@@ -1542,6 +1602,9 @@ namespace MBO_Market_Data_Analytics
                     isExecutionConnectionActive = true;
                     Log("Execution (broker) connection re-established. Triggering reconciliation...", StrategyLoggingLevel.Info);
                     ReconcileBrokerState();
+                    // C-07: after relinking broker state, confirm the open position is still covered
+                    // by a working stop; fills/cancels during the outage may have left it naked.
+                    VerifyProtectionInvariant("execution reconnect");
                 }
                 else if (isData)
                 {
@@ -1711,6 +1774,11 @@ namespace MBO_Market_Data_Analytics
         public OrderStatus Status { get; init; }
         public Order? OrderInstance { get; init; }
         public OrderRole Role { get; init; }
+        // C-07: SL vs TP known at placement time. Freshly placed brackets have OrderInstance == null
+        // until OnCoreOrderAdded links them, so OrderInstance-based classification would omit them
+        // from the protection check. This hint lets classification work immediately. Null = unknown
+        // (reconciled order — fall back to the linked OrderInstance's type).
+        public bool? IsStopHint { get; init; }
     }
 
     // H-08: classifies queued broker work so the lifecycle can selectively drop entries (on halt)

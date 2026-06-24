@@ -32,7 +32,9 @@ namespace MBO_Market_Data_Analytics
         [InputParameter("Max Exposure (Contracts)", 5, minimum: 1, maximum: 100, increment: 1)]
         public int MaxExposure = 2;
 
-        [InputParameter("Max Daily Loss ($)", 6, minimum: 0, maximum: 100000, increment: 10)]
+        // M-06: 0 disables the daily-loss cap entirely (see CheckHardRiskHalt). A non-zero value is
+        // the dollar loss at which the strategy flattens and halts.
+        [InputParameter("Max Daily Loss ($, 0 = disabled)", 6, minimum: 0, maximum: 100000, increment: 10)]
         public double MaxDailyLoss = 500.0;
 
         [InputParameter("Buyer/Seller Ratio Buy Threshold", 7, minimum: 1.0, maximum: 10.0, increment: 0.1)]
@@ -514,22 +516,19 @@ namespace MBO_Market_Data_Analytics
             if (calc == null || engine == null) return;
 
             DateTime now = DateTime.UtcNow;
-
-            if (!engine.IsBookValid || !calc.IsCalibrated)
-            {
-                if ((now - lastStatusLogTime).TotalSeconds >= 30)
-                {
-                    lastStatusLogTime = now;
-                    string reason = !engine.IsBookValid ? "L2 book not yet seeded" : "engine calibrating (MTR warmup)";
-                    Log($"[Status] {reason} — no signals yet.", StrategyLoggingLevel.Info);
-                }
-                return;
-            }
             double lastPrice = CurrentSymbol?.Last ?? 0.0;
             double bid = CurrentSymbol?.Bid ?? 0.0;
             double ask = CurrentSymbol?.Ask ?? 0.0;
+            bool wantLive = ResolveWantLive();
 
-            // 1. Process paper bracket exits every event, then re-evaluate promotion/demotion.
+            // ── C-10 Layer 1: hard risk — ALWAYS runs, independent of book validity, MTR
+            // calibration, adaptive warmup, and ratio availability. Those are precisely the degraded
+            // conditions under which a live position most needs the software daily-loss cap enforced.
+            if (CheckHardRiskHalt(wantLive, lastPrice, now))
+                return;
+
+            // ── C-10 Layer 2: paper/shadow exit management — runs whenever a valid price exists,
+            // even before the analytics book/calibration is ready, so open paper trades still exit.
             if (shadowSim != null && shadowSim.InPosition && lastPrice > 0)
             {
                 if (shadowSim.OnMarket(lastPrice, now))
@@ -540,7 +539,17 @@ namespace MBO_Market_Data_Analytics
             }
             UpdateExecutionMode(lastPrice, now);
 
-            bool wantLive = ResolveWantLive();
+            // ── C-10 Layer 3: entry signal generation — only runs when analytics are valid and warm.
+            if (!engine.IsBookValid || !calc.IsCalibrated)
+            {
+                if ((now - lastStatusLogTime).TotalSeconds >= 30)
+                {
+                    lastStatusLogTime = now;
+                    string reason = !engine.IsBookValid ? "L2 book not yet seeded" : "engine calibrating (MTR warmup)";
+                    Log($"[Status] {reason} — no new entries (risk/exits still active).", StrategyLoggingLevel.Info);
+                }
+                return;
+            }
 
             // 2. Signal ratio + effective parameters (shared by live and shadow paths).
             var ratioVal = calc.GetBuyerSellerQtyRatioShort();
@@ -615,22 +624,7 @@ namespace MBO_Market_Data_Analytics
 
             lock (stateLock)
             {
-                // Live-only Max Daily Loss guard. currentPositionSize carries the sign, so
-                // currentPositionSize * (lastPrice - averageEntryPrice) * pointCost is correct both ways.
-                if (wantLive && lastPrice > 0.0)
-                {
-                    double pointCost = GetPointCost();
-                    double openPnL = currentPositionSize * (lastPrice - averageEntryPrice) * pointCost;
-                    double totalPnL = strategyRealizedPnL + openPnL;
-                    if (totalPnL <= -MaxDailyLoss)
-                    {
-                        isRiskHalted = true;
-                        Log($"[Risk Limit] Daily loss threshold of -{MaxDailyLoss:C2} exceeded. PnL: {totalPnL:C2}. Flattening and Halting.", StrategyLoggingLevel.Error);
-                        FlattenPosition();
-                        return;
-                    }
-                }
-
+                // Hard daily-loss risk is enforced in Layer 1 (CheckHardRiskHalt) before this point.
                 bool isWithinCooldown = (now - lastOrderPlacementTime) < TimeSpan.FromSeconds(InputCooldownSeconds);
 
                 // Phase 3: regime gate — stand aside on volatility spike, extreme ratio, or thin queue.
@@ -719,6 +713,33 @@ namespace MBO_Market_Data_Analytics
                     else if (ratio <= sellReset) sellSignalActive = false;
                 }
             }
+        }
+
+        // C-10 Layer 1: hard risk check that must run on every event regardless of analytics state.
+        // Returns true if the daily-loss cap was breached and a halt+flatten was triggered, so the
+        // caller stops further processing for this event.
+        // M-06: MaxDailyLoss == 0 means "disabled", not "halt at break-even" — guard with > 0.
+        private bool CheckHardRiskHalt(bool wantLive, double lastPrice, DateTime now)
+        {
+            if (!wantLive || lastPrice <= 0.0 || MaxDailyLoss <= 0.0)
+                return false;
+
+            lock (stateLock)
+            {
+                // currentPositionSize carries the sign, so currentPositionSize * (lastPrice -
+                // averageEntryPrice) * pointCost is correct for both long and short positions.
+                double pointCost = GetPointCost();
+                double openPnL = currentPositionSize * (lastPrice - averageEntryPrice) * pointCost;
+                double totalPnL = strategyRealizedPnL + openPnL;
+                if (totalPnL <= -MaxDailyLoss)
+                {
+                    isRiskHalted = true;
+                    Log($"[Risk Limit] Daily loss threshold of -{MaxDailyLoss:C2} exceeded. PnL: {totalPnL:C2}. Flattening and Halting.", StrategyLoggingLevel.Error);
+                    FlattenPosition();
+                    return true;
+                }
+            }
+            return false;
         }
 
         // Routes a newly-activated signal to the live broker path or the paper simulator.

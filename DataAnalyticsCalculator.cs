@@ -373,6 +373,13 @@ namespace MBO_Market_Data_Analytics
         public void ProcessLevel2(DateTime time, string? id, double price, double size, bool isBid, bool closed)
         {
             // MBP path only. In MBO mode the host routes events through ProcessMboEvent instead.
+            // C-04: a feed reset (FLUSH) commonly carries zero price/size, so detect it BEFORE the
+            // price guard — otherwise the reset marker is silently dropped and stale orders persist.
+            if (string.Equals(id, "FLUSH", StringComparison.OrdinalIgnoreCase))
+            {
+                lock (locker) { Reset(); }
+                return;
+            }
             if (price <= 0) return;
 
             lock (locker)
@@ -381,9 +388,6 @@ namespace MBO_Market_Data_Analytics
 
                 if (!IsCalibrated)
                     calibrationL2MessagesCount++;
-
-                if (closed && string.Equals(id, "FLUSH", StringComparison.OrdinalIgnoreCase))
-                { Reset(); return; }
 
                 bool pHasBid = hasBestBid, pHasAsk = hasBestAsk;
                 long pBidT = bestBidTicks, pAskT = bestAskTicks;
@@ -432,16 +436,19 @@ namespace MBO_Market_Data_Analytics
         /// </summary>
         public void ProcessMboEvent(MboEvent evt)
         {
+            // C-04: detect FLUSH reset markers before the price guard — they commonly carry zero
+            // price/size, so the previous price<=0 early-return dropped them and left a stale book.
+            if (string.Equals(evt.OrderId, "FLUSH", StringComparison.OrdinalIgnoreCase))
+            {
+                lock (locker) { Reset(); }
+                return;
+            }
             if (evt.Price <= 0) return;
             if (evt.Action == MboAction.Trade || evt.Action == MboAction.Snapshot) return;
 
             lock (locker)
             {
                 AdvanceTo(evt.Time.Ticks);
-
-                if (evt.Action == MboAction.Remove &&
-                    string.Equals(evt.OrderId, "FLUSH", StringComparison.OrdinalIgnoreCase))
-                { Reset(); return; }
 
                 if (!IsCalibrated)
                     calibrationL2MessagesCount++;
@@ -589,6 +596,7 @@ namespace MBO_Market_Data_Analytics
                 UpdateBest(isBid, tick, nt);
                 var cBook = isBid ? bidCountBook : askCountBook;
                 cBook[tick] = (cBook.TryGetValue(tick, out int cx) ? cx : 0) + 1;
+                GridIndexAdd(id, size); // M-03: include snapshot-seeded orders in the grid lattice index
                 RefreshBestCounts();
             }
         }
@@ -713,6 +721,7 @@ namespace MBO_Market_Data_Analytics
             mboAddByOrderId.Clear();
             ordersBySizeBucket.Clear();
             gridMaker = default;
+            mboScanCountdown = 0; // M-04: force a fresh scan on the next event after a reseed
             bidCountBook.Clear();
             askCountBook.Clear();
             bestBidOrderCount = 0;

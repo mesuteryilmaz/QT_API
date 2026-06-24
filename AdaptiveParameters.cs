@@ -306,9 +306,16 @@ namespace MBO_Market_Data_Analytics
             bool voltSpike = voltRatio > cfg.VolatilityGateRatio;
 
             // Gate 2: extreme ratio — current ratio in the pathological tail beyond entry thresholds.
+            // H-04: when the extreme percentile itself sits at a clamp boundary (e.g. the 97th
+            // percentile is the saturation value RatioClampMax), a strict >/< test can never flag a
+            // saturated reading as extreme. Use boundary-inclusive comparisons and treat the
+            // denominator-zero/saturation extremes (ratio at 0 or at the clamp ceiling) as pathological.
             double extremeBuyTh = Percentile(arr, cfg.ExtremeUpperPercentile);
             double extremeSellTh = Percentile(arr, cfg.ExtremeLowerPercentile);
-            bool extremeRatio = lastObservedRatio > extremeBuyTh || lastObservedRatio < extremeSellTh;
+            bool saturated = lastObservedRatio >= cfg.RatioClampMax || lastObservedRatio <= 0.0;
+            bool extremeRatio = saturated
+                || lastObservedRatio >= extremeBuyTh
+                || lastObservedRatio <= extremeSellTh;
 
             RegimeState regime = (voltSpike || extremeRatio) ? RegimeState.StandAside : RegimeState.Normal;
 

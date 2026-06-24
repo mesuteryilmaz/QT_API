@@ -1395,7 +1395,12 @@ namespace MBO_Market_Data_Analytics
                 }
                 else if (isData)
                 {
-                    Log("Data connection re-established.", StrategyLoggingLevel.Info);
+                    // C-05: incremental book updates lost during the disconnect are gone from the live
+                    // stream, so the current book may be stale. Force a full host rebuild; RequestResync
+                    // drops isBookValid, so the Layer-3 entry gate keeps new entries paused until a
+                    // fresh two-sided snapshot is verified by the worker.
+                    Log("Data connection re-established. Forcing book resync before resuming entries.", StrategyLoggingLevel.Info);
+                    engine?.RequestResync("data connection re-established");
                 }
             }
             else if (e.NewState == ConnectionState.Disconnected || e.NewState == ConnectionState.Fail)

@@ -493,6 +493,15 @@ namespace MBO_Market_Data_Analytics
             }
             else if (evt.Kind == MarketEventKind.BookLevel)
             {
+                // C-04: a feed FLUSH reset invalidates the entire book. Route it through the resync
+                // path so BOTH book representations are cleared and isBookValid is dropped, rather
+                // than letting only the calculator reset while the host still reports a valid book.
+                if (string.Equals(evt.Id, "FLUSH", StringComparison.OrdinalIgnoreCase))
+                {
+                    RequestResync("feed FLUSH reset received");
+                    return;
+                }
+
                 if (Calculator.MboMode && mboBook != null)
                 {
                     // Normalise raw quote into a typed MboEvent (Add/Update/Remove) and process
@@ -526,8 +535,16 @@ namespace MBO_Market_Data_Analytics
                         if (coverage < 0.5)
                         {
                             log($"MBO real-ID coverage too low ({coverage:P0} over first {totalSeen} events) — downgrading to MBP mode.", LoggingLevel.System);
+                            // C-03: the book accumulated so far was built under MBO (per-order)
+                            // semantics. Flipping the flag alone leaves that state in place, and
+                            // subsequent MBP full-size updates would be applied on top of it, blending
+                            // two incompatible representations. Clear all book-derived state and reseed
+                            // a clean MBP baseline from a fresh snapshot before processing more events.
                             Calculator.MboMode = false;
                             mboBook = null;
+                            Calculator.ResetBookStateOnly();
+                            isBookValid = false;
+                            SeedBookSnapshot();
                         }
                         else
                         {
@@ -549,6 +566,7 @@ namespace MBO_Market_Data_Analytics
 
             Calculator?.ResetBookStateOnly();
             mboBook?.Clear();
+            mboBook?.ResetCoverageCounters(); // M-02: coverage stats must describe the rebuilt epoch
             isBookValid = false;
 
             try
@@ -627,6 +645,22 @@ namespace MBO_Market_Data_Analytics
             // the next event triggers another recovery attempt rather than re-entering normal
             // processing against an invalid book.
             if (isBookValid) isQueueOverflowed = false;
+        }
+
+        /// <summary>
+        /// C-04 / C-05: Request a full order-book rebuild. Thread-safe — callable from any thread
+        /// (e.g. the strategy's connection-state callback on data reconnect, or a feed FLUSH on the
+        /// worker). The book is marked invalid immediately so consumers stop trusting it; the worker
+        /// then drains the queue and reseeds from a fresh snapshot via the existing recovery path.
+        /// Buffered pre-reset incrementals are discarded rather than replayed onto the new snapshot.
+        /// If no events are flowing (e.g. during a disconnect), the book simply stays invalid until
+        /// the stream resumes and the next event drives the rebuild.
+        /// </summary>
+        public void RequestResync(string reason)
+        {
+            log($"[Book Resync] {reason} — book invalidated; worker will rebuild from a fresh snapshot.", LoggingLevel.System);
+            isBookValid = false;
+            isQueueOverflowed = true;
         }
 
         private void CheckSessionRollover(DateTime utcTime)

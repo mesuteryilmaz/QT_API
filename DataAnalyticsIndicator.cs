@@ -192,12 +192,12 @@ namespace MBO_Market_Data_Analytics
         // Order Flow Imbalance
         public MetricValue Ofi { get; init; }
 
-        // Grid Market Maker Detector
-        public MetricValue GridMakerScore { get; init; }
-        public MetricValue GridMakerBidLevels { get; init; }
-        public MetricValue GridMakerAskLevels { get; init; }
-        public MetricValue GridMakerSpacingTicks { get; init; }
-        public MetricValue GridMakerOrderSize { get; init; }
+        // Symmetric Lattice (grid/ladder) Detector
+        public MetricValue LatticeScore { get; init; }
+        public MetricValue LatticeBidRungs { get; init; }
+        public MetricValue LatticeAskRungs { get; init; }
+        public MetricValue LatticeSpacingTicks { get; init; }
+        public MetricValue LatticeRungSize { get; init; }
     }
 
     /// <summary>
@@ -421,20 +421,20 @@ namespace MBO_Market_Data_Analytics
                 drawY1 += rowHeight;
                 drawY1 += 7; // Separator
 
-                // Category 7: Grid Market Maker Detector
-                DrawCategoryHeader(g, "7. GRID MAKER DETECTOR", fontCategory, col1X, drawY1, colWidth);
+                // Category 7: Symmetric Lattice (grid/ladder) Detector
+                DrawCategoryHeader(g, "7. SYMMETRIC LATTICE DETECTOR", fontCategory, col1X, drawY1, colWidth);
                 drawY1 += 17;
 
-                DrawMetricValueRow(g, "Grid Confidence Score", snapshot.GridMakerScore, "P0", fontLabel, fontValue, textSecondary, accentOrange, col1X, drawY1, colWidth);
+                DrawMetricValueRow(g, "Lattice Confidence Score", snapshot.LatticeScore, "P0", fontLabel, fontValue, textSecondary, accentOrange, col1X, drawY1, colWidth);
                 drawY1 += rowHeight;
 
-                DrawMetricCombinedValueRow(g, "Grid Bid / Ask Levels", snapshot.GridMakerBidLevels, "F0", snapshot.GridMakerAskLevels, "F0", fontLabel, fontValue, textSecondary, textPrimary, col1X, drawY1, colWidth);
+                DrawMetricCombinedValueRow(g, "Lattice Bid / Ask Rungs", snapshot.LatticeBidRungs, "F0", snapshot.LatticeAskRungs, "F0", fontLabel, fontValue, textSecondary, textPrimary, col1X, drawY1, colWidth);
                 drawY1 += rowHeight;
 
-                DrawMetricValueRow(g, "Grid Spacing (Ticks)", snapshot.GridMakerSpacingTicks, "F0", fontLabel, fontValue, textSecondary, textPrimary, col1X, drawY1, colWidth);
+                DrawMetricValueRow(g, "Lattice Spacing (Ticks)", snapshot.LatticeSpacingTicks, "F0", fontLabel, fontValue, textSecondary, textPrimary, col1X, drawY1, colWidth);
                 drawY1 += rowHeight;
 
-                DrawMetricValueRow(g, "Grid Order Size", snapshot.GridMakerOrderSize, "F0", fontLabel, fontValue, textSecondary, textPrimary, col1X, drawY1, colWidth);
+                DrawMetricValueRow(g, "Lattice Rung Size", snapshot.LatticeRungSize, "F0", fontLabel, fontValue, textSecondary, textPrimary, col1X, drawY1, colWidth);
 
                 // ==========================================
                 // COLUMN 2: DOM, ARRIVALS & MICROSTRUCTURE

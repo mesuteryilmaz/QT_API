@@ -203,19 +203,27 @@ namespace MBO_Market_Data_Analytics
         // the order was added. Enables exact add→cancel matching without a price+time heuristic.
         private readonly Dictionary<string, L2AdditionTracker> mboAddByOrderId = new Dictionary<string, L2AdditionTracker>();
 
-        // Grid market maker detection (MBO mode only).
-        private struct GridMakerResult
+        // Symmetric lattice (grid/ladder) detection. Operates on price LEVELS (bidBook/askBook), so it
+        // is available in both MBO and MBP mode. A grid maker rests similar-size orders at regular tick
+        // spacing on both sides; we look for a regularly-spaced run of similar-size levels per side,
+        // require bid/ask symmetry, and gate the reported confidence on temporal PERSISTENCE — a real
+        // ladder sits across consecutive scans, transient clusters do not. NOTE: without participant
+        // IDs this is a structural "lattice score", not proof of a single market maker (audit H-14).
+        private struct LatticeResult
         {
-            public long OrderSize;
-            public int BidLevels;
-            public int AskLevels;
+            public long RungSize;     // representative resting size per rung
+            public int BidRungs;
+            public int AskRungs;
             public int SpacingTicks;
             public double Symmetry;
-            public double Score;
+            public double RawScore;   // pre-persistence structural score in [0,1]
         }
-        private readonly Dictionary<long, HashSet<string>> ordersBySizeBucket = new();
-        private GridMakerResult gridMaker;
-        private int mboScanCountdown = 0;
+        private LatticeResult lattice;        // last structural scan
+        private double latticeScore;          // persistence-weighted confidence in [0,1]
+        private int latticePersist;           // consecutive scans matching the same (size, spacing)
+        private long latticeLastSize, latticeLastSpacing;
+        private long latticeLastScanTicks;
+        private const long LATTICE_SCAN_INTERVAL_TICKS = 250 * TimeSpan.TicksPerMillisecond;
 
         // Per-price order counts (MBO mode only). Maintained in parallel with bidBook/askBook so that
         // the number of distinct orders at the best bid/ask can be read in O(1).
@@ -474,13 +482,11 @@ namespace MBO_Market_Data_Analytics
                             double purged = ApplyPriceLevelDelta(dup.IsBid, dup.Ticks, -dup.Size);
                             UpdateBest(dup.IsBid, dup.Ticks, purged);
                             CountBookDec(dup.IsBid, dup.Ticks);
-                            GridIndexRemove(orderId, dup.Size);
                         }
                         double nt = ApplyPriceLevelDelta(isBid, tick, evt.Size);
                         mboOrders[orderId] = new MboLevelRef { Ticks = tick, Size = evt.Size, IsBid = isBid };
                         UpdateBest(isBid, tick, nt);
                         CountBookInc(isBid, tick);
-                        GridIndexAdd(orderId, evt.Size);
                         if (!isDuplicate) RecordL2Addition(evt.Time, evt.Price, evt.Size, isBid, orderId);
                         break;
                     }
@@ -494,9 +500,7 @@ namespace MBO_Market_Data_Analytics
                                 if (delta != 0)
                                 {
                                     double nt = ApplyPriceLevelDelta(isBid, tick, delta);
-                                    GridIndexRemove(orderId, existing.Size);
                                     existing.Size = evt.Size;
-                                    GridIndexAdd(orderId, existing.Size);
                                     UpdateBest(isBid, tick, nt);
                                     if (delta > 0) RecordL2Addition(evt.Time, evt.Price, delta, isBid, orderId);
                                     else HandleL2Reduction(evt.Time, evt.Price, -delta, isBid, orderId);
@@ -510,12 +514,10 @@ namespace MBO_Market_Data_Analytics
                                 double oldTotal = ApplyPriceLevelDelta(existing.IsBid, existing.Ticks, -existing.Size);
                                 UpdateBest(existing.IsBid, existing.Ticks, oldTotal);
                                 CountBookDec(existing.IsBid, existing.Ticks);
-                                GridIndexRemove(orderId, existing.Size);
                                 double newTotal = ApplyPriceLevelDelta(isBid, tick, evt.Size);
                                 existing.Ticks = tick; existing.Size = evt.Size; existing.IsBid = isBid;
                                 UpdateBest(isBid, tick, newTotal);
                                 CountBookInc(isBid, tick);
-                                GridIndexAdd(orderId, evt.Size);
                                 totalRepriceCount++;
                                 totalRepriceQty += evt.Size;
                             }
@@ -527,7 +529,6 @@ namespace MBO_Market_Data_Analytics
                             mboOrders[orderId] = new MboLevelRef { Ticks = tick, Size = evt.Size, IsBid = isBid };
                             UpdateBest(isBid, tick, nt);
                             CountBookInc(isBid, tick);
-                            GridIndexAdd(orderId, evt.Size);
                             RecordL2Addition(evt.Time, evt.Price, evt.Size, isBid, orderId);
                         }
                         break;
@@ -537,7 +538,6 @@ namespace MBO_Market_Data_Analytics
                         if (mboOrders.TryGetValue(orderId, out var o))
                         {
                             double nt = ApplyPriceLevelDelta(o.IsBid, o.Ticks, -o.Size);
-                            GridIndexRemove(orderId, o.Size);
                             mboOrders.Remove(orderId);
                             UpdateBest(o.IsBid, o.Ticks, nt);
                             CountBookDec(o.IsBid, o.Ticks);
@@ -548,11 +548,6 @@ namespace MBO_Market_Data_Analytics
                 }
 
                 RefreshBestCounts();
-                if (--mboScanCountdown <= 0)
-                {
-                    gridMaker = ScanForGridMaker();
-                    mboScanCountdown = 40;
-                }
                 AccumulateOfi(pHasBid, pBidT, pBidSz, pHasAsk, pAskT, pAskSz);
                 PruneUnmatchedTrades(evt.Time);
                 PruneMicrostructureCollections(evt.Time);
@@ -596,7 +591,6 @@ namespace MBO_Market_Data_Analytics
                 UpdateBest(isBid, tick, nt);
                 var cBook = isBid ? bidCountBook : askCountBook;
                 cBook[tick] = (cBook.TryGetValue(tick, out int cx) ? cx : 0) + 1;
-                GridIndexAdd(id, size); // M-03: include snapshot-seeded orders in the grid lattice index
                 RefreshBestCounts();
             }
         }
@@ -630,6 +624,13 @@ namespace MBO_Market_Data_Analytics
             long ofiCutoff = currentTicks - (long)(OFI_WINDOW_SECONDS * TimeSpan.TicksPerSecond);
             while (ofiWindow.Count > 0 && ofiWindow.Peek().ticks < ofiCutoff)
                 ofiSum -= ofiWindow.Dequeue().v;
+
+            // Throttled symmetric-lattice scan (~4/s of event time, MBO or MBP).
+            if (currentTicks - latticeLastScanTicks >= LATTICE_SCAN_INTERVAL_TICKS)
+            {
+                latticeLastScanTicks = currentTicks;
+                UpdateLatticeDetector();
+            }
 
             return ticks;
         }
@@ -719,9 +720,11 @@ namespace MBO_Market_Data_Analytics
         {
             mboOrders.Clear();
             mboAddByOrderId.Clear();
-            ordersBySizeBucket.Clear();
-            gridMaker = default;
-            mboScanCountdown = 0; // M-04: force a fresh scan on the next event after a reseed
+            lattice = default;
+            latticeScore = 0.0;
+            latticePersist = 0;
+            latticeLastSize = latticeLastSpacing = 0;
+            latticeLastScanTicks = 0; // M-04: force a fresh scan on the next event after a reseed
             bidCountBook.Clear();
             askCountBook.Clear();
             bestBidOrderCount = 0;
@@ -733,105 +736,122 @@ namespace MBO_Market_Data_Analytics
             ofiSum = 0;
         }
 
-        private static long SizeBucketKey(double size) => (long)Math.Round(size);
+        private const long LATTICE_WINDOW_TICKS = 100; // look this far from best for ladder rungs
+        private const int LATTICE_MIN_RUNGS = 3;       // minimum regularly-spaced levels per side
+        private const int LATTICE_FULL_RUNGS = 5;      // depth bonus saturates here
+        private const int LATTICE_MIN_PERSIST = 4;     // scans (~1s) before confidence reaches RawScore
+        private const int LATTICE_MAX_PERSIST = 8;
 
-        private void GridIndexAdd(string orderId, double size)
+        // Runs the structural scan and folds it into a persistence-weighted confidence. Called on a
+        // throttled cadence from AdvanceTo, under locker.
+        private void UpdateLatticeDetector()
         {
-            long key = SizeBucketKey(size);
-            if (!ordersBySizeBucket.TryGetValue(key, out var set))
-                ordersBySizeBucket[key] = set = new HashSet<string>();
-            set.Add(orderId);
+            lattice = ScanSymmetricLattice();
+
+            // Persistence: a real ladder keeps the same (rung size, spacing) across consecutive scans.
+            bool sameAsLast = lattice.RawScore > 0 &&
+                              lattice.RungSize == latticeLastSize &&
+                              lattice.SpacingTicks == latticeLastSpacing;
+            if (sameAsLast)
+                latticePersist = Math.Min(LATTICE_MAX_PERSIST, latticePersist + 1);
+            else
+                latticePersist = lattice.RawScore > 0 ? 1 : 0;
+
+            latticeLastSize = lattice.RungSize;
+            latticeLastSpacing = lattice.SpacingTicks;
+
+            double persistFrac = Math.Min(1.0, latticePersist / (double)LATTICE_MIN_PERSIST);
+            latticeScore = lattice.RawScore * persistFrac;
         }
 
-        private void GridIndexRemove(string orderId, double size)
+        private LatticeResult ScanSymmetricLattice()
         {
-            long key = SizeBucketKey(size);
-            if (ordersBySizeBucket.TryGetValue(key, out var set))
+            if (!hasBestBid || !hasBestAsk) return default;
+
+            var bid = FindLadder(bidBook, isBid: true, bestBidTicks);
+            var ask = FindLadder(askBook, isBid: false, bestAskTicks);
+
+            if (bid.rungs < LATTICE_MIN_RUNGS || ask.rungs < LATTICE_MIN_RUNGS) return default;
+            if (bid.spacing < 1 || Math.Abs(bid.spacing - ask.spacing) > 1) return default; // symmetric spacing
+
+            // Symmetric rung size (the two sides quote a similar size).
+            double sizeSym = (double)Math.Min(bid.size, ask.size) / Math.Max(bid.size, ask.size);
+            if (sizeSym < 0.5) return default;
+
+            double rungSym = (double)Math.Min(bid.rungs, ask.rungs) / Math.Max(bid.rungs, ask.rungs);
+            double reg = (bid.regularity + ask.regularity) / 2.0;
+            double depthBonus = Math.Min(1.0, Math.Min(bid.rungs, ask.rungs) / (double)LATTICE_FULL_RUNGS);
+            double raw = reg * Math.Sqrt(rungSym) * sizeSym * depthBonus;
+
+            return new LatticeResult
             {
-                set.Remove(orderId);
-                if (set.Count == 0) ordersBySizeBucket.Remove(key);
-            }
+                RungSize = (bid.size + ask.size) / 2,
+                BidRungs = bid.rungs,
+                AskRungs = ask.rungs,
+                SpacingTicks = (bid.spacing + ask.spacing) / 2,
+                Symmetry = rungSym,
+                RawScore = raw
+            };
         }
 
-        private GridMakerResult ScanForGridMaker()
+        // Finds the strongest regularly-spaced run of similar-size price LEVELS on one side, within a
+        // window of the best. Groups levels by rounded resting size, then for each size band finds the
+        // longest contiguous run of levels spaced at the modal gap. Returns (#rungs, spacing, size, reg).
+        private (int rungs, int spacing, long size, double regularity) FindLadder(
+            SortedDictionary<long, double> book, bool isBid, long bestTick)
         {
-            GridMakerResult best = default;
-
-            var bidTicks = new List<long>();
-            var askTicks = new List<long>();
-
-            foreach (var kvp in ordersBySizeBucket)
+            var bySize = new Dictionary<long, List<long>>();
+            foreach (var kv in book)
             {
-                // Skip buckets too small to form a grid, or so large they are clearly
-                // just all-market 1-lot noise (no real grid has 50+ levels per side).
-                int count = kvp.Value.Count;
-                if (count < 4 || count > 60) continue;
-
-                bidTicks.Clear();
-                askTicks.Clear();
-                foreach (var id in kvp.Value)
-                {
-                    if (mboOrders.TryGetValue(id, out var o))
-                    {
-                        if (o.IsBid) bidTicks.Add(o.Ticks);
-                        else askTicks.Add(o.Ticks);
-                    }
-                }
-                if (bidTicks.Count < 2 || askTicks.Count < 2) continue;
-
-                bidTicks.Sort();
-                askTicks.Sort();
-
-                double bidReg = MeasureGridSpacing(bidTicks, out int bidSpacing);
-                double askReg = MeasureGridSpacing(askTicks, out int askSpacing);
-
-                if (Math.Abs(bidSpacing - askSpacing) > 2) continue;
-                int spacing = (bidSpacing + askSpacing) / 2;
-                if (spacing < 1) continue;
-
-                double symmetry = (double)Math.Min(bidTicks.Count, askTicks.Count) / Math.Max(bidTicks.Count, askTicks.Count);
-                double levelBonus = Math.Min(1.0, Math.Min(bidTicks.Count, askTicks.Count) / 5.0);
-                double score = bidReg * askReg * Math.Sqrt(symmetry) * levelBonus;
-
-                if (score > best.Score)
-                {
-                    best = new GridMakerResult
-                    {
-                        OrderSize = kvp.Key,
-                        BidLevels = bidTicks.Count,
-                        AskLevels = askTicks.Count,
-                        SpacingTicks = spacing,
-                        Symmetry = symmetry,
-                        Score = score
-                    };
-                }
+                if (kv.Value <= 0) continue;
+                long dist = isBid ? bestTick - kv.Key : kv.Key - bestTick;
+                if (dist < 0 || dist > LATTICE_WINDOW_TICKS) continue;
+                long sz = (long)Math.Round(kv.Value);
+                if (sz <= 0) continue;
+                if (!bySize.TryGetValue(sz, out var lst)) bySize[sz] = lst = new List<long>();
+                lst.Add(kv.Key);
             }
 
-            return best;
+            int bestRungs = 0, bestSpacing = 0; long bestSize = 0; double bestReg = 0.0;
+            foreach (var kv in bySize)
+            {
+                var ticks = kv.Value;
+                if (ticks.Count < LATTICE_MIN_RUNGS) continue;
+                ticks.Sort();
+
+                int g = ModalGap(ticks);
+                if (g <= 0) continue;
+
+                int onGrid = 0, gaps = ticks.Count - 1, longest = 1, cur = 1;
+                for (int i = 1; i < ticks.Count; i++)
+                {
+                    if (ticks[i] - ticks[i - 1] == g) { onGrid++; cur++; if (cur > longest) longest = cur; }
+                    else cur = 1;
+                }
+                if (longest < LATTICE_MIN_RUNGS) continue;
+                double reg = gaps > 0 ? onGrid / (double)gaps : 0.0;
+
+                if (longest > bestRungs || (longest == bestRungs && reg > bestReg))
+                {
+                    bestRungs = longest; bestSpacing = g; bestSize = kv.Key; bestReg = reg;
+                }
+            }
+            return (bestRungs, bestSpacing, bestSize, bestReg);
         }
 
-        private static double MeasureGridSpacing(List<long> sortedTicks, out int medianSpacing)
+        private static int ModalGap(List<long> sortedTicks)
         {
-            medianSpacing = 0;
-            if (sortedTicks.Count < 2) return 0.0;
-
-            var gaps = new long[sortedTicks.Count - 1];
-            for (int i = 0; i < gaps.Length; i++)
-                gaps[i] = sortedTicks[i + 1] - sortedTicks[i];
-            Array.Sort(gaps);
-            medianSpacing = (int)gaps[gaps.Length / 2];
-            if (medianSpacing <= 0) return 0.0;
-
-            double mean = 0.0;
-            foreach (var g in gaps) mean += g;
-            mean /= gaps.Length;
-
-            double variance = 0.0;
-            foreach (var g in gaps) variance += (g - mean) * (g - mean);
-            variance /= gaps.Length;
-
-            double cv = mean > 0 ? Math.Sqrt(variance) / mean : 1.0;
-            return Math.Max(0.0, 1.0 - cv);
+            var counts = new Dictionary<long, int>();
+            for (int i = 1; i < sortedTicks.Count; i++)
+            {
+                long g = sortedTicks[i] - sortedTicks[i - 1];
+                if (g <= 0) continue;
+                counts[g] = (counts.TryGetValue(g, out int c) ? c : 0) + 1;
+            }
+            int bestC = 0; long bestG = 0;
+            foreach (var kv in counts)
+                if (kv.Value > bestC) { bestC = kv.Value; bestG = kv.Key; }
+            return (int)bestG;
         }
 
         private void CountBookInc(bool isBid, long tick)
@@ -1261,22 +1281,24 @@ namespace MBO_Market_Data_Analytics
         public MetricValue GetOfi()
             => CreateMetric(ofiSum, IsL2Warm() ? MetricQuality.Derived : MetricQuality.Unavailable, IsCalibrated);
 
-        // --- 6b. Grid Market Maker Detector ---
+        // --- 6b. Symmetric Lattice (grid/ladder) Detector ---
+        // Price-level based, so available in both MBO and MBP mode. Score is a persistence-gated
+        // structural confidence in [0,1], not proof of a single market maker (no participant IDs).
 
-        public MetricValue GetGridMakerScore()
-            => CreateMetric(gridMaker.Score, MboMode && IsL2Warm() ? MetricQuality.Derived : MetricQuality.Unavailable, IsCalibrated);
+        public MetricValue GetLatticeScore()
+            => CreateMetric(latticeScore, IsL2Warm() ? MetricQuality.Derived : MetricQuality.Unavailable, IsCalibrated);
 
-        public MetricValue GetGridMakerBidLevels()
-            => CreateMetric(gridMaker.BidLevels, MboMode && IsL2Warm() ? MetricQuality.Derived : MetricQuality.Unavailable, IsCalibrated);
+        public MetricValue GetLatticeBidRungs()
+            => CreateMetric(lattice.BidRungs, IsL2Warm() ? MetricQuality.Derived : MetricQuality.Unavailable, IsCalibrated);
 
-        public MetricValue GetGridMakerAskLevels()
-            => CreateMetric(gridMaker.AskLevels, MboMode && IsL2Warm() ? MetricQuality.Derived : MetricQuality.Unavailable, IsCalibrated);
+        public MetricValue GetLatticeAskRungs()
+            => CreateMetric(lattice.AskRungs, IsL2Warm() ? MetricQuality.Derived : MetricQuality.Unavailable, IsCalibrated);
 
-        public MetricValue GetGridMakerSpacingTicks()
-            => CreateMetric(gridMaker.SpacingTicks, MboMode && IsL2Warm() ? MetricQuality.Derived : MetricQuality.Unavailable, IsCalibrated);
+        public MetricValue GetLatticeSpacingTicks()
+            => CreateMetric(lattice.SpacingTicks, IsL2Warm() ? MetricQuality.Derived : MetricQuality.Unavailable, IsCalibrated);
 
-        public MetricValue GetGridMakerOrderSize()
-            => CreateMetric(gridMaker.OrderSize, MboMode && IsL2Warm() ? MetricQuality.Derived : MetricQuality.Unavailable, IsCalibrated);
+        public MetricValue GetLatticeRungSize()
+            => CreateMetric(lattice.RungSize, IsL2Warm() ? MetricQuality.Derived : MetricQuality.Unavailable, IsCalibrated);
 
         // --- 6. VWAP Analytics ---
 

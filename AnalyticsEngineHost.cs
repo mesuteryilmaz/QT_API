@@ -800,11 +800,11 @@ namespace MBO_Market_Data_Analytics
 
                 Ofi = calc.GetOfi(),
 
-                GridMakerScore = calc.GetGridMakerScore(),
-                GridMakerBidLevels = calc.GetGridMakerBidLevels(),
-                GridMakerAskLevels = calc.GetGridMakerAskLevels(),
-                GridMakerSpacingTicks = calc.GetGridMakerSpacingTicks(),
-                GridMakerOrderSize = calc.GetGridMakerOrderSize()
+                LatticeScore = calc.GetLatticeScore(),
+                LatticeBidRungs = calc.GetLatticeBidRungs(),
+                LatticeAskRungs = calc.GetLatticeAskRungs(),
+                LatticeSpacingTicks = calc.GetLatticeSpacingTicks(),
+                LatticeRungSize = calc.GetLatticeRungSize()
             };
 
             if (config.EnableFeatureStore && !string.IsNullOrEmpty(config.FeatureStorePath))

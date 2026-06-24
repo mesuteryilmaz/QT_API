@@ -440,7 +440,7 @@ namespace MBO_Market_Data_Analytics
             {
                 FlattenPosition();
                 return Task.CompletedTask;
-            }, 0);
+            }, 0, TaskCategory.Flatten);
 
             lock (stateLock)
             {
@@ -952,7 +952,7 @@ namespace MBO_Market_Data_Analytics
                     isOrderPlacementPending = false;
                 }
                 return Task.CompletedTask;
-            }, 2);
+            }, 2, TaskCategory.EntryPlacement);
         }
 
         private void FlattenPosition()
@@ -970,7 +970,7 @@ namespace MBO_Market_Data_Analytics
                     {
                         ord.Cancel();
                         return Task.CompletedTask;
-                    }, 0);
+                    }, 0, TaskCategory.Flatten);
                 }
             }
 
@@ -1000,7 +1000,7 @@ namespace MBO_Market_Data_Analytics
                     });
                 }
                 return Task.CompletedTask;
-            }, 1);
+            }, 1, TaskCategory.Flatten);
         }
 
         private double GetBrokerPositionSize()
@@ -1018,7 +1018,7 @@ namespace MBO_Market_Data_Analytics
             {
                 if (trackedOrders.TryGetValue(order.Id, out var state))
                 {
-                    state.OrderInstance = order;
+                    trackedOrders[order.Id] = state with { OrderInstance = order };
                     order.Updated += OnOrderUpdated;
                     Log($"[Order Linked] Connected instance for tracked order: {order.Id}.", StrategyLoggingLevel.Info);
                 }
@@ -1091,9 +1091,15 @@ namespace MBO_Market_Data_Analytics
                 double oldCumAvg = state.CumAverageFillPrice;
                 double newCumAvg = ord.AverageFillPrice > 0 ? ord.AverageFillPrice : state.Price;
 
-                state.Status = newStatus;
-                state.FilledQuantity = newFilled;
-                state.CumAverageFillPrice = newCumAvg;
+                // H-09: atomically replace the immutable state. A single order's Updated events are
+                // serialized by the platform, so this read-modify-write is not re-entered for the
+                // same key; other threads only ever read a complete prior/next snapshot.
+                trackedOrders[ord.Id] = state with
+                {
+                    Status = newStatus,
+                    FilledQuantity = newFilled,
+                    CumAverageFillPrice = newCumAvg
+                };
 
                 if (newFilled > oldFilled)
                 {
@@ -1111,7 +1117,7 @@ namespace MBO_Market_Data_Analytics
                         {
                             Log($"[OCO Guard] Bracket {ord.Id} filled after position was already flat — rejecting to prevent reversal.", StrategyLoggingLevel.Error);
                             var ordRefOco = ord;
-                            prioritizedQueue?.Enqueue(() => { ordRefOco.Cancel(); return Task.CompletedTask; }, 0);
+                            prioritizedQueue?.Enqueue(() => { ordRefOco.Cancel(); return Task.CompletedTask; }, 0, TaskCategory.Protection);
                         }
                     }
 
@@ -1209,7 +1215,7 @@ namespace MBO_Market_Data_Analytics
                         {
                             ord.Cancel();
                             return Task.CompletedTask;
-                        }, 0);
+                        }, 0, TaskCategory.Protection);
                     }
                 }
             }
@@ -1336,7 +1342,7 @@ namespace MBO_Market_Data_Analytics
                     }
                 }
                 return Task.CompletedTask;
-            }, 2);
+            }, 2, TaskCategory.Protection); // C-07: priority elevation above entries lands in Step 4
         }
 
         private void ReconcileBracketQuantities()
@@ -1394,7 +1400,7 @@ namespace MBO_Market_Data_Analytics
                             {
                                 ord.Cancel();
                                 return Task.CompletedTask;
-                            }, 0);
+                            }, 0, TaskCategory.Protection);
                         }
                         excess -= remainingOrderQty;
                     }
@@ -1413,7 +1419,7 @@ namespace MBO_Market_Data_Analytics
                                 };
                                 Core.Instance.ModifyOrder(modifyParams);
                                 return Task.CompletedTask;
-                            }, 1);
+                            }, 1, TaskCategory.Protection);
                         }
                         excess = 0;
                     }
@@ -1541,7 +1547,7 @@ namespace MBO_Market_Data_Analytics
                 }
                 else
                 {
-                    state.OrderInstance = ord;
+                    trackedOrders[ord.Id] = state with { OrderInstance = ord };
                     ord.Updated -= OnOrderUpdated;
                     ord.Updated += OnOrderUpdated;
                 }
@@ -1572,55 +1578,95 @@ namespace MBO_Market_Data_Analytics
         Reconciled   // Re-discovered from the broker; role unknown
     }
 
-    // Helper state structures
-    internal class TrackedOrderState
+    // Helper state structures.
+    // H-09: immutable. Every mutation produces a new instance via `with` and is swapped into the
+    // ConcurrentDictionary atomically, so readers on other threads always see a self-consistent
+    // snapshot (never a torn mix of Status/FilledQuantity/CumAverageFillPrice/OrderInstance).
+    internal sealed record TrackedOrderState
     {
         public string LocalId { get; init; } = null!;
         public string? OrderId { get; init; }
         public Side Side { get; init; }
         public double Price { get; init; }
         public double Quantity { get; init; }
-        public double FilledQuantity { get; set; }
-        public double CumAverageFillPrice { get; set; } // M-12: tracks cumulative avg to derive marginal fill price
-        public OrderStatus Status { get; set; }
-        public Order? OrderInstance { get; set; }
+        public double FilledQuantity { get; init; }
+        public double CumAverageFillPrice { get; init; } // M-12: cumulative avg to derive marginal fill price
+        public OrderStatus Status { get; init; }
+        public Order? OrderInstance { get; init; }
         public OrderRole Role { get; init; }
     }
 
-    internal class PrioritizedAsyncTaskQueue
+    // H-08: classifies queued broker work so the lifecycle can selectively drop entries (on halt)
+    // while preserving protection/flatten work already scheduled.
+    internal enum TaskCategory : byte { General, EntryPlacement, Protection, Flatten }
+
+    internal sealed class PrioritizedAsyncTaskQueue
     {
-        private readonly PriorityQueue<Func<Task>, int> queue = new();
+        private readonly PriorityQueue<(Func<Task> action, TaskCategory category), int> queue = new();
         private readonly object lockObj = new();
         private readonly SemaphoreSlim semaphore = new(0);
         private readonly CancellationTokenSource cts = new();
-        private readonly Thread workerThread;
+        private readonly Task consumer;
+        private volatile bool accepting = true;
 
         public PrioritizedAsyncTaskQueue()
         {
-            workerThread = new Thread(ProcessQueueLoop)
-            {
-                IsBackground = true,
-                Name = "PrioritizedAsyncTaskQueueWorker"
-            };
-            workerThread.Start();
+            // H-08: the consumer is a retained Task whose lifetime is owned and awaitable, rather than
+            // an `async void` Thread entry whose continuations escape to the thread pool after the
+            // first await (leaving the dedicated thread dead and shutdown unable to join it).
+            consumer = Task.Run(ProcessQueueLoopAsync);
         }
 
-        public void Enqueue(Func<Task> taskAction, int priority)
+        public bool IsAccepting => accepting;
+
+        // H-08: enqueue is rejected once StopAccepting()/Shutdown() has run, so no new broker work can
+        // be scheduled during halt/teardown. Returns false if the item was not accepted.
+        public bool Enqueue(Func<Task> taskAction, int priority, TaskCategory category = TaskCategory.General)
+        {
+            if (taskAction == null) return false;
+            lock (lockObj)
+            {
+                if (!accepting) return false;
+                queue.Enqueue((taskAction, category), priority);
+            }
+            semaphore.Release();
+            return true;
+        }
+
+        // H-08: stop taking new work without tearing down the consumer (used when entering Halting).
+        public void StopAccepting() => accepting = false;
+
+        // H-08: drop queued entry-placement tasks (e.g. on halt) while preserving protection/flatten
+        // work already queued. Returns the number of entry tasks removed.
+        public int CancelPendingEntries()
         {
             lock (lockObj)
             {
-                queue.Enqueue(taskAction, priority);
+                if (queue.Count == 0) return 0;
+                var kept = new List<((Func<Task> action, TaskCategory category) item, int priority)>(queue.Count);
+                int removed = 0;
+                while (queue.TryDequeue(out var item, out int prio))
+                {
+                    if (item.category == TaskCategory.EntryPlacement) { removed++; continue; }
+                    kept.Add((item, prio));
+                }
+                foreach (var k in kept) queue.Enqueue(k.item, k.priority);
+                return removed;
             }
-            semaphore.Release();
         }
 
-        public void Shutdown()
+        // H-08: graceful shutdown — stop accepting, wake the consumer, and wait (bounded) for any
+        // in-flight task to finish so teardown does not race queued broker work.
+        public void Shutdown(int waitMs = 2000)
         {
+            accepting = false;
             cts.Cancel();
             semaphore.Release();
+            try { consumer.Wait(waitMs); }
+            catch (AggregateException) { /* consumer faulted/cancelled — already logged in the loop */ }
         }
 
-        private async void ProcessQueueLoop()
+        private async Task ProcessQueueLoopAsync()
         {
             while (!cts.Token.IsCancellationRequested)
             {
@@ -1628,20 +1674,18 @@ namespace MBO_Market_Data_Analytics
                 {
                     await semaphore.WaitAsync(cts.Token);
 
-                    Func<Task>? taskAction = null;
+                    (Func<Task> action, TaskCategory category)? work = null;
                     lock (lockObj)
                     {
                         if (queue.Count > 0)
-                        {
-                            taskAction = queue.Dequeue();
-                        }
+                            work = queue.Dequeue();
                     }
 
-                    if (taskAction != null)
+                    if (work != null)
                     {
                         try
                         {
-                            await taskAction();
+                            await work.Value.action();
                         }
                         catch (Exception ex)
                         {

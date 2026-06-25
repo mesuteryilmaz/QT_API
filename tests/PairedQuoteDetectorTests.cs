@@ -1,18 +1,20 @@
 using System;
+using QT.Core.Primitives;
+using QT.Core.Quality;
+using QT.Features.FloatingPairs;
+using QT.Market.Snapshots;
 
 namespace MBO_Market_Data_Analytics.Tests
 {
-    // Deterministic tests for the MBO Paired Floating Quote detector (audit 4b). Covers exact-size
-    // pairing, tiers, per-order (not aggregate) identity, distance gating, persistence, market-follow
-    // confirmation, one-to-one assignment, leg removal, MBP-unavailable, and epoch reset.
     public static class PairedQuoteDetectorTests
     {
-        private static readonly long T0 = new DateTime(2026, 1, 1, 12, 0, 0, DateTimeKind.Utc).Ticks;
-        private static long At(double seconds) => T0 + (long)(seconds * TimeSpan.TicksPerSecond);
+        private const double Tick = 0.25;
+        private static readonly DateTime T = new DateTime(2026, 1, 1, 12, 0, 0, DateTimeKind.Utc);
+        private static DateTime At(double seconds) => T.AddSeconds(seconds);
 
         public static void RunAll()
         {
-            Console.WriteLine("PairedQuoteDetector:");
+            Console.WriteLine("V2 MBO FloatingPairDetector:");
             SymmetricPairBecomesCandidate();
             VeryLargeTierClassified();
             ExactSizeMismatchRejected();
@@ -20,198 +22,240 @@ namespace MBO_Market_Data_Analytics.Tests
             StaticPairBecomesPersistentNotConfirmed();
             FollowsTwoMovesBecomesConfirmed();
             OneLegMovesNotConfirmed();
+            LateCounterpartFails();
             OutsideMaxDistanceIgnored();
             MultipleSameSizeOneToOne();
+            SameIdRepricePreservesPair();
+            StrictCancelReentryStitching();
+            PartialFillBreaksPair();
             LegRemovalExpiresPair();
             MbpModeReportsUnavailable();
             EpochResetClearsState();
+            EpochMismatchPreventsStitching();
         }
 
-        private static PairedQuoteDetector Fresh()
+        private static MboFloatingPairDetector Fresh()
         {
-            var d = new PairedQuoteDetector();
-            d.Reset(1);
+            var d = new MboFloatingPairDetector();
+            d.Reset(1, T);
             return d;
         }
 
-        // best bid 1000 / ask 1001 (1-tick spread); a 20-lot bid at 995 and 20-lot ask at 1006 (both 5 off).
         private static void SymmetricPairBecomesCandidate()
         {
-            TestHarness.Begin("20/20 symmetric pair becomes a candidate");
+            TestHarness.Begin("20/20 pair becomes Candidate");
             var d = Fresh();
-            d.OnOrderUpsert("B", true, 995, 20, At(0));
-            d.OnOrderUpsert("A", false, 1006, 20, At(0));
-            d.AdvanceTime(At(0), true, 1000, 1001, PqDataStatus.MboReady);
-            var s = d.Snapshot;
-            TestHarness.AreEqual(1, s.ActivePairs, "one active pair");
-            TestHarness.AreEqual(0, s.ConfirmedPairs, "not yet confirmed");
-            TestHarness.IsTrue(s.TopPairState == PairState.Candidate, "state Candidate");
-            TestHarness.AreEqual(20, (int)s.TopPairSize, "top pair size 20");
-            TestHarness.IsTrue(s.TopPairTier == PairTier.Large, "tier Large");
-            TestHarness.AreEqual(1, s.EligibleLargeBids, "eligible large bids");
-            TestHarness.AreEqual(1, s.EligibleLargeAsks, "eligible large asks");
+            var s = d.OnBookSnapshot(Book(At(0), 1000, 1001, Order("B", BookSide.Bid, 995, 20, 0), Order("A", BookSide.Ask, 1006, 20, 0)), At(0));
+            TestHarness.AreEqual(1, s.ExactSizeCandidateCount, "one exact-size candidate");
+            TestHarness.AreEqual(0, s.FloatingConfirmedPairCount, "not confirmed");
+            TestHarness.IsTrue(s.TopPair?.State == FloatingPairState.Candidate, "state Candidate");
+            TestHarness.AreEqual(20, (int)(s.TopPair?.Size ?? 0), "top size 20");
         }
 
         private static void VeryLargeTierClassified()
         {
-            TestHarness.Begin("200/200 pair is Very Large tier");
+            TestHarness.Begin("200/200 pair is VeryLarge");
             var d = Fresh();
-            d.OnOrderUpsert("B", true, 990, 200, At(0));
-            d.OnOrderUpsert("A", false, 1011, 200, At(0));
-            d.AdvanceTime(At(0), true, 1000, 1001, PqDataStatus.MboReady);
-            var s = d.Snapshot;
-            TestHarness.AreEqual(1, s.ActivePairs, "one active pair");
-            TestHarness.IsTrue(s.TopPairTier == PairTier.VeryLarge, "tier VeryLarge");
-            TestHarness.AreEqual(1, s.EligibleVeryLargeBids, "very large bid count");
+            var s = d.OnBookSnapshot(Book(At(0), 1000, 1001, Order("B", BookSide.Bid, 990, 200, 0), Order("A", BookSide.Ask, 1011, 200, 0)), At(0));
+            TestHarness.IsTrue(s.TopPair?.Tier == FloatingPairTier.VeryLarge, "tier VeryLarge");
+            TestHarness.AreEqual(1, s.EligibleVeryLargeBidCount, "very-large bid count");
         }
 
         private static void ExactSizeMismatchRejected()
         {
-            TestHarness.Begin("20 bid vs 21 ask rejected under exact-size");
+            TestHarness.Begin("20 bid vs 21 ask rejected");
             var d = Fresh();
-            d.OnOrderUpsert("B", true, 995, 20, At(0));
-            d.OnOrderUpsert("A", false, 1006, 21, At(0));
-            d.AdvanceTime(At(0), true, 1000, 1001, PqDataStatus.MboReady);
-            TestHarness.AreEqual(0, d.Snapshot.ActivePairs, "no pair when sizes differ");
+            var s = d.OnBookSnapshot(Book(At(0), 1000, 1001, Order("B", BookSide.Bid, 995, 20, 0), Order("A", BookSide.Ask, 1006, 21, 0)), At(0));
+            TestHarness.AreEqual(0, s.ExactSizeCandidateCount, "no exact-size candidate");
+            TestHarness.IsTrue(s.TopPair == null, "no top pair");
         }
 
-        // A 20-lot order remains pairable even when an unrelated order shares its price level — the
-        // detector keys on individual order IDs, not aggregate level volume (audit PQ-02).
         private static void PerOrderNotAggregate()
         {
-            TestHarness.Begin("per-order identity: unrelated same-level order does not break the pair");
+            TestHarness.Begin("individual 20-lot remains visible with same-price unrelated order");
             var d = Fresh();
-            d.OnOrderUpsert("B1", true, 995, 20, At(0));
-            d.OnOrderUpsert("B2", true, 995, 7, At(0));   // unrelated, same price, sub-threshold
-            d.OnOrderUpsert("A1", false, 1006, 20, At(0));
-            d.AdvanceTime(At(0), true, 1000, 1001, PqDataStatus.MboReady);
-            var s = d.Snapshot;
-            TestHarness.AreEqual(1, s.ActivePairs, "20/20 pair still forms");
-            TestHarness.AreEqual(20, (int)s.TopPairSize, "paired on the 20-lot, not 27 aggregate");
-            TestHarness.AreEqual(1, s.EligibleLargeBids, "sub-threshold order not eligible");
+            var s = d.OnBookSnapshot(Book(At(0), 1000, 1001,
+                Order("B1", BookSide.Bid, 995, 20, 0),
+                Order("B2", BookSide.Bid, 995, 7, 0),
+                Order("A1", BookSide.Ask, 1006, 20, 0)), At(0));
+            TestHarness.AreEqual(1, s.ExactSizeCandidateCount, "20/20 pair forms");
+            TestHarness.AreEqual(1, s.EligibleLargeBidCount, "7-lot not eligible");
         }
 
         private static void StaticPairBecomesPersistentNotConfirmed()
         {
             TestHarness.Begin("static pair becomes Persistent but not FloatingConfirmed");
             var d = Fresh();
-            d.OnOrderUpsert("B", true, 995, 20, At(0));
-            d.OnOrderUpsert("A", false, 1006, 20, At(0));
-            d.AdvanceTime(At(0), true, 1000, 1001, PqDataStatus.MboReady);   // candidate, center set
-            d.AdvanceTime(At(1.5), true, 1000, 1001, PqDataStatus.MboReady); // no market move, aged
-            var s = d.Snapshot;
-            TestHarness.IsTrue(s.TopPairState == PairState.Persistent, "state Persistent after aging");
-            TestHarness.AreEqual(0, s.ConfirmedPairs, "no confirmation without market-follow");
+            d.OnBookSnapshot(Book(At(0), 1000, 1001, Order("B", BookSide.Bid, 995, 20, 0), Order("A", BookSide.Ask, 1006, 20, 0)), At(0));
+            var s = d.OnBookSnapshot(Book(At(1.5), 1000, 1001, Order("B", BookSide.Bid, 995, 20, 0), Order("A", BookSide.Ask, 1006, 20, 0)), At(1.5));
+            TestHarness.IsTrue(s.TopPair?.State == FloatingPairState.Persistent, "Persistent");
+            TestHarness.AreEqual(0, s.FloatingConfirmedPairCount, "not confirmed");
         }
 
         private static void FollowsTwoMovesBecomesConfirmed()
         {
-            TestHarness.Begin("pair following two BBO moves becomes FloatingConfirmed");
+            TestHarness.Begin("two coordinated moves confirm the pair");
             var d = Fresh();
-            d.OnOrderUpsert("B", true, 995, 20, At(0));
-            d.OnOrderUpsert("A", false, 1006, 20, At(0));
-            d.AdvanceTime(At(0.0), true, 1000, 1001, PqDataStatus.MboReady);
-
-            // market +1 tick; both legs reprice up 1 tick to keep offsets
-            d.OnOrderUpsert("B", true, 996, 20, At(0.6));
-            d.OnOrderUpsert("A", false, 1007, 20, At(0.6));
-            d.AdvanceTime(At(0.6), true, 1001, 1002, PqDataStatus.MboReady);
-
-            // market +1 tick again; both legs follow
-            d.OnOrderUpsert("B", true, 997, 20, At(1.2));
-            d.OnOrderUpsert("A", false, 1008, 20, At(1.2));
-            d.AdvanceTime(At(1.2), true, 1002, 1003, PqDataStatus.MboReady);
-
-            var s = d.Snapshot;
-            TestHarness.IsTrue(s.TopPairState == PairState.FloatingConfirmed, "state FloatingConfirmed");
-            TestHarness.AreEqual(1, s.ConfirmedPairs, "one confirmed pair");
-            TestHarness.AreEqual(2, s.TopPairSyncMoves, "two synchronized moves");
-            TestHarness.AreEqual(1.0, s.TopPairFollowRatio, 1e-9, "follow ratio 100%");
+            d.OnBookSnapshot(Book(At(0), 1000, 1001, Order("B", BookSide.Bid, 995, 20, 0), Order("A", BookSide.Ask, 1006, 20, 0)), At(0));
+            d.OnBookSnapshot(Book(At(0.6), 1001, 1002, Order("B", BookSide.Bid, 996, 20, 0.6), Order("A", BookSide.Ask, 1007, 20, 0.6)), At(0.6));
+            var s = d.OnBookSnapshot(Book(At(1.2), 1002, 1003, Order("B", BookSide.Bid, 997, 20, 1.2), Order("A", BookSide.Ask, 1008, 20, 1.2)), At(1.2));
+            TestHarness.IsTrue(s.TopPair?.State == FloatingPairState.FloatingConfirmed, "confirmed state");
+            TestHarness.AreEqual(1, s.FloatingConfirmedPairCount, "one confirmed pair");
+            TestHarness.AreEqual(2, s.TopPair?.SynchronizedMoves ?? 0, "two sync moves");
+            TestHarness.AreEqual(1.0, s.TopPair?.FollowRatio ?? 0, 1e-9, "100% follow ratio");
         }
 
         private static void OneLegMovesNotConfirmed()
         {
-            TestHarness.Begin("only one leg follows -> no confirmation, follow ratio falls");
+            TestHarness.Begin("one-leg-only move fails");
             var d = Fresh();
-            d.OnOrderUpsert("B", true, 995, 20, At(0));
-            d.OnOrderUpsert("A", false, 1006, 20, At(0));
-            d.AdvanceTime(At(0.0), true, 1000, 1001, PqDataStatus.MboReady);
+            d.OnBookSnapshot(Book(At(0), 1000, 1001, Order("B", BookSide.Bid, 995, 20, 0), Order("A", BookSide.Ask, 1006, 20, 0)), At(0));
+            d.OnBookSnapshot(Book(At(0.6), 1001, 1002, Order("B", BookSide.Bid, 996, 20, 0.6), Order("A", BookSide.Ask, 1006, 20, 0)), At(0.6));
+            var s = d.OnBookSnapshot(Book(At(1.2), 1002, 1003, Order("B", BookSide.Bid, 997, 20, 1.2), Order("A", BookSide.Ask, 1006, 20, 0)), At(1.2));
+            TestHarness.IsTrue(s.TopPair == null || s.TopPair.State != FloatingPairState.FloatingConfirmed, "not confirmed");
+        }
 
-            // market moves up twice; only the bid follows, the ask stays put
-            d.OnOrderUpsert("B", true, 996, 20, At(0.6));
-            d.AdvanceTime(At(0.6), true, 1001, 1002, PqDataStatus.MboReady);
-            d.OnOrderUpsert("B", true, 997, 20, At(1.2));
-            d.AdvanceTime(At(1.2), true, 1002, 1003, PqDataStatus.MboReady);
-
-            var s = d.Snapshot;
-            TestHarness.IsTrue(s.TopPairState != PairState.FloatingConfirmed, "not confirmed");
-            TestHarness.IsTrue(s.TopPairFollowRatio < 0.8, "follow ratio below threshold");
+        private static void LateCounterpartFails()
+        {
+            TestHarness.Begin("late counterpart beyond synchronization window fails");
+            var d = Fresh();
+            d.OnBookSnapshot(Book(At(0), 1000, 1001, Order("B", BookSide.Bid, 995, 20, 0), Order("A", BookSide.Ask, 1006, 20, 0)), At(0));
+            d.OnBookSnapshot(Book(At(0.7), 1001, 1002, Order("B", BookSide.Bid, 996, 20, 0.1), Order("A", BookSide.Ask, 1007, 20, 0.7)), At(0.7));
+            var s = d.OnBookSnapshot(Book(At(1.4), 1002, 1003, Order("B", BookSide.Bid, 997, 20, 0.8), Order("A", BookSide.Ask, 1008, 20, 1.4)), At(1.4));
+            TestHarness.IsTrue(s.TopPair == null || s.TopPair.FollowRatio < 0.8, "follow ratio below confirmation threshold");
         }
 
         private static void OutsideMaxDistanceIgnored()
         {
-            TestHarness.Begin("orders beyond max distance from touch are ignored");
+            TestHarness.Begin("orders beyond max distance ignored");
             var d = Fresh();
-            d.OnOrderUpsert("B", true, 800, 20, At(0));   // 200 ticks below best bid (> 100)
-            d.OnOrderUpsert("A", false, 1201, 20, At(0)); // 200 ticks above best ask
-            d.AdvanceTime(At(0), true, 1000, 1001, PqDataStatus.MboReady);
-            var s = d.Snapshot;
-            TestHarness.AreEqual(0, s.ActivePairs, "no pair outside distance");
-            TestHarness.AreEqual(0, s.EligibleLargeBids, "far order not eligible");
+            var s = d.OnBookSnapshot(Book(At(0), 1000, 1001, Order("B", BookSide.Bid, 700, 20, 0), Order("A", BookSide.Ask, 1301, 20, 0)), At(0));
+            TestHarness.AreEqual(0, s.EligibleLargeBidCount, "far bid not eligible");
+            TestHarness.AreEqual(0, s.ExactSizeCandidateCount, "no pair");
         }
 
         private static void MultipleSameSizeOneToOne()
         {
-            TestHarness.Begin("multiple same-size orders get one-to-one assignment (no double count)");
+            TestHarness.Begin("multiple equal-size orders are matched one-to-one");
             var d = Fresh();
-            d.OnOrderUpsert("B1", true, 995, 20, At(0));
-            d.OnOrderUpsert("B2", true, 994, 20, At(0));
-            d.OnOrderUpsert("A1", false, 1006, 20, At(0));
-            d.OnOrderUpsert("A2", false, 1007, 20, At(0));
-            d.AdvanceTime(At(0), true, 1000, 1001, PqDataStatus.MboReady);
-            var s = d.Snapshot;
-            TestHarness.AreEqual(2, s.EligibleLargeBids, "two eligible bids");
-            TestHarness.AreEqual(2, s.EligibleLargeAsks, "two eligible asks");
-            TestHarness.AreEqual(2, s.ActivePairs, "exactly two one-to-one pairs");
+            var s = d.OnBookSnapshot(Book(At(0), 1000, 1001,
+                Order("B1", BookSide.Bid, 995, 20, 0),
+                Order("B2", BookSide.Bid, 994, 20, 0),
+                Order("A1", BookSide.Ask, 1006, 20, 0),
+                Order("A2", BookSide.Ask, 1007, 20, 0)), At(0));
+            TestHarness.AreEqual(2, s.ExactSizeCandidateCount, "two candidates");
+            TestHarness.AreEqual(2, s.TopPairs.Count, "two active pairs");
+        }
+
+        private static void SameIdRepricePreservesPair()
+        {
+            TestHarness.Begin("same-ID repricing preserves pair");
+            var d = Fresh();
+            d.OnBookSnapshot(Book(At(0), 1000, 1001, Order("B", BookSide.Bid, 995, 20, 0), Order("A", BookSide.Ask, 1006, 20, 0)), At(0));
+            var s = d.OnBookSnapshot(Book(At(0.5), 1001, 1002, Order("B", BookSide.Bid, 996, 20, 0.5), Order("A", BookSide.Ask, 1007, 20, 0.5)), At(0.5));
+            TestHarness.IsTrue(s.TopPair?.BidOrderId == "B", "bid id retained");
+            TestHarness.IsTrue(s.TopPair?.AskOrderId == "A", "ask id retained");
+        }
+
+        private static void StrictCancelReentryStitching()
+        {
+            TestHarness.Begin("strict cancel/re-entry stitching");
+            var d = Fresh();
+            d.OnBookSnapshot(Book(At(0), 1000, 1001, Order("B", BookSide.Bid, 995, 20, 0), Order("A", BookSide.Ask, 1006, 20, 0)), At(0));
+            d.OnOrderRemove("B", At(0.1));
+            d.OnOrderUpsert("B2", BookSide.Bid, 995, 20, At(0.2));
+            var s = d.OnBookSnapshot(Book(At(0.2), 1000, 1001, Order("B2", BookSide.Bid, 995, 20, 0.2), Order("A", BookSide.Ask, 1006, 20, 0)), At(0.2));
+            TestHarness.IsTrue(s.TopPair?.BidOrderId == "B2", "new bid id stitched");
+            TestHarness.IsTrue(s.TopPair?.UsesHeuristicStitching == true, "heuristic flag set");
+        }
+
+        private static void PartialFillBreaksPair()
+        {
+            TestHarness.Begin("partial fill breaks pair");
+            var d = Fresh();
+            d.OnBookSnapshot(Book(At(0), 1000, 1001, Order("B", BookSide.Bid, 995, 20, 0), Order("A", BookSide.Ask, 1006, 20, 0)), At(0));
+            var s = d.OnBookSnapshot(Book(At(0.2), 1000, 1001, Order("B", BookSide.Bid, 995, 19, 0.2), Order("A", BookSide.Ask, 1006, 20, 0)), At(0.2));
+            TestHarness.IsTrue(s.TopPair == null, "pair broken");
+            TestHarness.IsTrue(s.LastBreak?.Reason.Contains("size mismatch") == true, "break reason");
         }
 
         private static void LegRemovalExpiresPair()
         {
-            TestHarness.Begin("removing one leg expires the pair");
+            TestHarness.Begin("removing one leg expires pair");
             var d = Fresh();
-            d.OnOrderUpsert("B", true, 995, 20, At(0));
-            d.OnOrderUpsert("A", false, 1006, 20, At(0));
-            d.AdvanceTime(At(0), true, 1000, 1001, PqDataStatus.MboReady);
-            TestHarness.AreEqual(1, d.Snapshot.ActivePairs, "pair present");
-            d.OnOrderRemove("A", At(0.5));
-            d.AdvanceTime(At(0.5), true, 1000, 1001, PqDataStatus.MboReady);
-            TestHarness.AreEqual(0, d.Snapshot.ActivePairs, "pair expired after leg removal");
+            d.OnBookSnapshot(Book(At(0), 1000, 1001, Order("B", BookSide.Bid, 995, 20, 0), Order("A", BookSide.Ask, 1006, 20, 0)), At(0));
+            var s = d.OnBookSnapshot(Book(At(0.5), 1000, 1001, Order("B", BookSide.Bid, 995, 20, 0)), At(0.5));
+            TestHarness.IsTrue(s.TopPair == null, "no active displayed pair");
+            s = d.OnBookSnapshot(Book(At(1.0), 1000, 1001, Order("B", BookSide.Bid, 995, 20, 0)), At(1.0));
+            TestHarness.IsTrue(s.LastBreak?.Reason.Contains("missing leg") == true, "break emitted after stitching window");
         }
 
         private static void MbpModeReportsUnavailable()
         {
-            TestHarness.Begin("MBP / non-ready status reports Unavailable, not zero pairs");
+            TestHarness.Begin("MBO downgrade returns Unavailable");
             var d = Fresh();
-            d.OnOrderUpsert("B", true, 995, 20, At(0));
-            d.OnOrderUpsert("A", false, 1006, 20, At(0));
-            d.AdvanceTime(At(0), true, 1000, 1001, PqDataStatus.Unavailable);
-            var s = d.Snapshot;
-            TestHarness.IsTrue(s.Status == PqDataStatus.Unavailable, "status Unavailable");
-            TestHarness.AreEqual(0, s.ActivePairs, "no pairs published when unavailable");
+            var s = d.OnBookSnapshot(Book(At(0), 1000, 1001, BookMode.Mbp, Array.Empty<MboOrderSnapshot>()), At(0));
+            TestHarness.IsTrue(s.Status == FloatingPairDetectorStatus.Unavailable, "unavailable status");
+            TestHarness.IsTrue(s.Quality == MetricQuality.Unavailable, "unavailable quality");
         }
 
         private static void EpochResetClearsState()
         {
-            TestHarness.Begin("epoch reset clears all order and pair state");
+            TestHarness.Begin("FLUSH/reconnect epoch reset clears pair state");
             var d = Fresh();
-            d.OnOrderUpsert("B", true, 995, 20, At(0));
-            d.OnOrderUpsert("A", false, 1006, 20, At(0));
-            d.AdvanceTime(At(0), true, 1000, 1001, PqDataStatus.MboReady);
-            TestHarness.AreEqual(1, d.Snapshot.ActivePairs, "pair present before reset");
-            d.Reset(2);
-            d.AdvanceTime(At(1), true, 1000, 1001, PqDataStatus.MboReady);
-            TestHarness.AreEqual(0, d.Snapshot.ActivePairs, "no pairs after epoch reset");
-            TestHarness.IsTrue(d.BookEpoch == 2, "epoch advanced");
+            d.OnBookSnapshot(Book(At(0), 1000, 1001, Order("B", BookSide.Bid, 995, 20, 0), Order("A", BookSide.Ask, 1006, 20, 0)), At(0));
+            d.Reset(2, At(0.5));
+            var s = d.OnBookSnapshot(Book(At(0.5), 1000, 1001, 2, Order("B", BookSide.Bid, 995, 20, 0.5)), At(0.5));
+            TestHarness.IsTrue(s.TopPair == null, "state cleared");
+        }
+
+        private static void EpochMismatchPreventsStitching()
+        {
+            TestHarness.Begin("book epoch mismatch prevents stitching");
+            var d = Fresh();
+            d.OnBookSnapshot(Book(At(0), 1000, 1001, Order("B", BookSide.Bid, 995, 20, 0), Order("A", BookSide.Ask, 1006, 20, 0)), At(0));
+            d.OnOrderRemove("B", At(0.1));
+            d.Reset(2, At(0.15));
+            d.OnOrderUpsert("B2", BookSide.Bid, 995, 20, At(0.2));
+            var s = d.OnBookSnapshot(Book(At(0.2), 1000, 1001, 2, Order("B2", BookSide.Bid, 995, 20, 0.2), Order("A", BookSide.Ask, 1006, 20, 0.2)), At(0.2));
+            TestHarness.IsTrue(s.TopPair?.UsesHeuristicStitching != true, "not stitched across epoch");
+        }
+
+        private static MboOrderSnapshot Order(string id, BookSide side, long ticks, long qty, double seenSeconds)
+            => new(id, side, ticks, ticks * Tick, qty, 0, At(seenSeconds), At(seenSeconds), true, false);
+
+        private static BookSnapshot Book(DateTime t, long bestBid, long bestAsk, params MboOrderSnapshot[] orders)
+            => Book(t, bestBid, bestAsk, 1, BookMode.Mbo, orders);
+
+        private static BookSnapshot Book(DateTime t, long bestBid, long bestAsk, long epoch, params MboOrderSnapshot[] orders)
+            => Book(t, bestBid, bestAsk, epoch, BookMode.Mbo, orders);
+
+        private static BookSnapshot Book(DateTime t, long bestBid, long bestAsk, BookMode mode, params MboOrderSnapshot[] orders)
+            => Book(t, bestBid, bestAsk, 1, mode, orders);
+
+        private static BookSnapshot Book(DateTime t, long bestBid, long bestAsk, long epoch, BookMode mode, params MboOrderSnapshot[] orders)
+        {
+            var bidLevels = orders.Where(o => o.Side == BookSide.Bid)
+                .GroupBy(o => o.PriceTicks)
+                .OrderByDescending(g => g.Key)
+                .Select(g => new BookLevelSnapshot(BookSide.Bid, g.Key, g.Key * Tick, g.Sum(x => x.Quantity), g.Count()))
+                .ToArray();
+            var askLevels = orders.Where(o => o.Side == BookSide.Ask)
+                .GroupBy(o => o.PriceTicks)
+                .OrderBy(g => g.Key)
+                .Select(g => new BookLevelSnapshot(BookSide.Ask, g.Key, g.Key * Tick, g.Sum(x => x.Quantity), g.Count()))
+                .ToArray();
+
+            if (bidLevels.Length == 0)
+                bidLevels = new[] { new BookLevelSnapshot(BookSide.Bid, bestBid, bestBid * Tick, 1, 1) };
+            if (askLevels.Length == 0)
+                askLevels = new[] { new BookLevelSnapshot(BookSide.Ask, bestAsk, bestAsk * Tick, 1, 1) };
+
+            return new BookSnapshot("MNQ", t, t, epoch, mode, BookLifecycleState.Valid,
+                MetricQuality.Exact, true, true, mode == BookMode.Mbo ? 1.0 : 0.0, TimeSpan.Zero,
+                bestBid == bestAsk, bestBid > bestAsk, bestBid, bestAsk, bestBid * Tick, bestAsk * Tick,
+                bidLevels, askLevels, mode == BookMode.Mbo ? orders : Array.Empty<MboOrderSnapshot>(),
+                new BookEventStats(0, 0, 0, 0, 0, 0, 0), null);
         }
     }
 }

@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    Self-contained V1 analytics PANEL plugin, kept available alongside the V2 indicator.
+    Re-namespaced to MBO_Market_Data_Analytics.LegacyV1 and shipped under a distinct assembly
+    name (MBP_Analytics_V1) so it cannot collide with the V2 host or its QT_API.V2.* assemblies.
+    Analytics-only: this compiles the panel + engine + calculator closure plus the raw MBO
+    recorder indicator (a research-capture tool with no V2 replacement) — no strategy, replay,
+    shadow, broker, or execution code.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <AssemblyName>MBP_Analytics_V1</AssemblyName>
+    <Version>1.0.0</Version>
+    <RootNamespace>TradingPlatform.BusinessLayer</RootNamespace>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="TradingPlatform.BusinessLayer">
+      <HintPath>C:\Quantower\TradingPlatform\v1.146.13\bin\TradingPlatform.BusinessLayer.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="DataAnalyticsCalculator.cs" />
+    <Compile Include="MboOrderBook.cs" />
+    <Compile Include="PairedQuoteDetector.cs" />
+    <Compile Include="AnalyticsEngineHost.cs" />
+    <Compile Include="DataAnalyticsIndicator.cs" />
+    <Compile Include="MboRecorder.cs" />
+    <Compile Include="MboRecorderIndicator.cs" />
+  </ItemGroup>
+  <Target Name="PostBuild" AfterTargets="PostBuildEvent">
+    <Copy SourceFiles="$(OutputPath)$(AssemblyName).dll" DestinationFolder="C:\Quantower\Settings\Scripts\Indicators\" SkipUnchangedFiles="false" />
+  </Target>
+</Project>

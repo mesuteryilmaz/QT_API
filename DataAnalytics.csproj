@@ -4,8 +4,12 @@
     <UseWindowsForms>true</UseWindowsForms>
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <AssemblyName>MBO_Market_Data_Analytics</AssemblyName>
+    <Version>2.0.0</Version>
+    <AssemblyVersion>2.0.0.0</AssemblyVersion>
+    <FileVersion>2.0.0.0</FileVersion>
     <RootNamespace>TradingPlatform.BusinessLayer</RootNamespace>
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
   </PropertyGroup>
@@ -16,24 +20,27 @@
     </Reference>
   </ItemGroup>
   <ItemGroup>
-    <Compile Include="AdaptiveParameters.cs" />
-    <Compile Include="AnalyticsEngineHost.cs" />
-    <Compile Include="Broker.cs" />
-    <Compile Include="ExecutionScheduler.cs" />
-    <Compile Include="ExecutionCore.cs" />
-    <Compile Include="ShadowSimulator.cs" />
-    <Compile Include="MboOrderBook.cs" />
-    <Compile Include="PairedQuoteDetector.cs" />
-    <Compile Include="MboRecorder.cs" />
-    <Compile Include="MboRecorderIndicator.cs" />
-    <Compile Include="DataAnalyticsCalculator.cs" />
-    <Compile Include="DataAnalyticsIndicator.cs" />
-    <Compile Include="DataAnalyticsStrategy.cs" />
-    <Compile Include="ReplayBacktester.cs" />
-    <Compile Include="ReplayBacktestIndicator.cs" />
+    <ProjectReference Include="src\QT.Core\QT.Core.csproj" />
+    <ProjectReference Include="src\QT.Market\QT.Market.csproj" />
+    <ProjectReference Include="src\QT.Features\QT.Features.csproj" />
+    <ProjectReference Include="src\QT.Storage\QT.Storage.csproj" />
+    <ProjectReference Include="src\QT.Runtime\QT.Runtime.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="src\QT.Quantower\Settings\BuildInfo.cs" />
+    <Compile Include="src\QT.Quantower\Host\AnalyticsEngineHost.cs" />
+    <Compile Include="src\QT.Quantower\Panel\DataAnalyticsIndicator.cs" />
   </ItemGroup>
   <Target Name="PostBuild" AfterTargets="PostBuildEvent">
-    <Copy SourceFiles="$(OutputPath)$(AssemblyName).dll" DestinationFolder="C:\Quantower\Settings\Scripts\Indicators\" SkipUnchangedFiles="false" />
-    <Copy SourceFiles="$(OutputPath)$(AssemblyName).dll" DestinationFolder="C:\Quantower\Settings\Scripts\Strategies\" SkipUnchangedFiles="false" />
+    <ItemGroup>
+      <QuantowerScriptDlls Include="$(OutputPath)$(AssemblyName).dll" />
+      <QuantowerScriptDlls Include="$(OutputPath)QT_API.V2.Core.dll" />
+      <QuantowerScriptDlls Include="$(OutputPath)QT_API.V2.Market.dll" />
+      <QuantowerScriptDlls Include="$(OutputPath)QT_API.V2.Features.dll" />
+      <QuantowerScriptDlls Include="$(OutputPath)QT_API.V2.Storage.dll" />
+      <QuantowerScriptDlls Include="$(OutputPath)QT_API.V2.Runtime.dll" />
+    </ItemGroup>
+    <Copy SourceFiles="@(QuantowerScriptDlls)" DestinationFolder="C:\Quantower\Settings\Scripts\Indicators\" SkipUnchangedFiles="false" />
+    <Copy SourceFiles="@(QuantowerScriptDlls)" DestinationFolder="C:\Quantower\Settings\Scripts\Strategies\" SkipUnchangedFiles="false" />
   </Target>
 </Project>

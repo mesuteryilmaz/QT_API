@@ -5,9 +5,8 @@ Generated: `2026-06-25T16:28:28.4983362+03:00`
 ## Source
 
 - Branch: `analytics-v2`
-- HEAD: `3c93df668447ddbff94010c4b2302f910aff777b`
-- Worktree: dirty, with V2 implementation changes and pre-existing untracked `.vscode/` plus `QT_API_V2_CODEX_IMPLEMENTATION_PROMPT.md`.
-- Runtime source marker: `3c93df668447ddbff94010c4b2302f910aff777b-dirty-analytics-v2`
+- HEAD: `758fd89ccb6fede3384882020e1eb6855df04158` (V2 rearchitecture + V1 legacy plugin + cleanup committed; worktree clean apart from gitignored `bin/`, `obj/`, `.vscode/`).
+- Note: the V2 support/host DLL hashes below are byte-identical to the earlier dirty `3c93df6` build — the post-Codex cleanup only deleted dead V1 root duplicates, moved the MBO recorder into the V1 plugin, and removed a redundant test project, none of which changed V2 source. The build is deterministic, so these hashes reproduce from commit `758fd89`.
 
 ## Toolchain
 
@@ -32,14 +31,15 @@ Results:
 ## Test Commands
 
 ```powershell
-dotnet run --project tests\DataAnalytics.Tests.csproj -c Release
 dotnet run --project tests\QT.UnitTests\QT.UnitTests.csproj -c Release
 ```
 
 Results:
 
-- `DataAnalytics.Tests`: `230 passed, 0 failed`.
 - `QT.UnitTests`: `230 passed, 0 failed`.
+
+(The redundant `tests\DataAnalytics.Tests.csproj`, which compiled the same harness, was
+removed in the cleanup; `QT.UnitTests` is now the single canonical test runner.)
 
 ## DLL Hashes
 
@@ -49,6 +49,8 @@ SHA-256:
 |---|---|
 | `C:\Users\mesuteryilmaz\Desktop\QT_API\bin\Debug\MBO_Market_Data_Analytics.dll` | `C91FAF43D911A3A6484EF86EDDEDDE87330E083476A55F0D092E344FA66C2EA3` |
 | `C:\Users\mesuteryilmaz\Desktop\QT_API\bin\Release\MBO_Market_Data_Analytics.dll` | `06D5B1963680C96F9AB60645968FAA2757C860E7D7F4A002B0BBDA5BBAF44C67` |
+| `C:\Users\mesuteryilmaz\Desktop\QT_API\legacy_v1\bin\Release\MBP_Analytics_V1.dll` (V1 legacy panel + MBO recorder plugin) | `B64CC42021170B8A49BFBB9AC30B4ABA426F6A394E76E7C6BABD4612038D1E11` |
+| `C:\Quantower\Settings\Scripts\Indicators\MBP_Analytics_V1.dll` | `B64CC42021170B8A49BFBB9AC30B4ABA426F6A394E76E7C6BABD4612038D1E11` |
 | `C:\Quantower\Settings\Scripts\Indicators\MBO_Market_Data_Analytics.dll` | `06D5B1963680C96F9AB60645968FAA2757C860E7D7F4A002B0BBDA5BBAF44C67` |
 | `C:\Quantower\Settings\Scripts\Indicators\QT_API.V2.Core.dll` | `2F6A7615B863E2454F6EF2A729E416D879FCEFB2BC11F498AF5CBA9FECBAEF6F` |
 | `C:\Quantower\Settings\Scripts\Indicators\QT_API.V2.Market.dll` | `440B9B4190499BD6DA33713BE24CEE36E3E49A2F796381201B58D49C14E23D04` |

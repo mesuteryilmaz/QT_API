@@ -198,6 +198,30 @@ namespace MBO_Market_Data_Analytics
         public MetricValue LatticeAskRungs { get; init; }
         public MetricValue LatticeSpacingTicks { get; init; }
         public MetricValue LatticeRungSize { get; init; }
+
+        // Market Regime Monitor (spread / volatility / flow speed / regime)
+        public MetricValue BidAskSpreadTicks { get; init; }
+        public MetricValue AvgSpreadTicks { get; init; }
+        public MetricValue SpreadVolatility { get; init; }
+        public MetricValue MidRealizedVol { get; init; }
+        public MetricValue OrderFlowSpeed { get; init; }
+        public MetricValue RegimeStress { get; init; }
+        public MetricValue MarketRegime { get; init; }
+        public MetricValue SecondsSinceRegimeChange { get; init; }
+
+        // MBO Paired Floating Quote Detector
+        public MetricValue PqStatus { get; init; }
+        public MetricValue PqEligibleLargeBids { get; init; }
+        public MetricValue PqEligibleLargeAsks { get; init; }
+        public MetricValue PqActivePairs { get; init; }
+        public MetricValue PqConfirmedPairs { get; init; }
+        public MetricValue PqTopPairSize { get; init; }
+        public MetricValue PqTopPairTier { get; init; }
+        public MetricValue PqTopBidOffset { get; init; }
+        public MetricValue PqTopAskOffset { get; init; }
+        public MetricValue PqTopSyncMoves { get; init; }
+        public MetricValue PqTopFollowRatio { get; init; }
+        public MetricValue PqConfidence { get; init; }
     }
 
     /// <summary>
@@ -307,7 +331,7 @@ namespace MBO_Market_Data_Analytics
             // Position and Size of Dashboard
             int x = 20;
             int y = 50;
-            int width = 740;
+            int width = 1110;
             int height = 560;
             int rowHeight = 19;
 
@@ -351,6 +375,7 @@ namespace MBO_Market_Data_Analytics
                 // Column X Coordinates (Width: 345 each, 20px gap)
                 int col1X = x + 15;
                 int col2X = x + 380;
+                int col3X = x + 745;
                 int colWidth = 345;
 
                 // ==========================================
@@ -503,6 +528,74 @@ namespace MBO_Market_Data_Analytics
                 drawY2 += rowHeight;
 
                 DrawMetricCombinedValueRow(g, "Spoofing Score Bid / Ask (60s)", snapshot.SpoofScoreBid, "F0", snapshot.SpoofScoreAsk, "F0", fontLabel, fontValue, textSecondary, textPrimary, col2X, drawY2, colWidth, isQty: true);
+
+                // ==========================================
+                // COLUMN 3: REGIME MONITOR & PAIRED QUOTES
+                // ==========================================
+                int drawY3 = y + 42;
+
+                // Category 8: Market Regime Monitor
+                DrawCategoryHeader(g, "8. MARKET REGIME MONITOR", fontCategory, col3X, drawY3, colWidth);
+                drawY3 += 17;
+
+                DrawMetricCombinedValueRow(g, "Spread Cur / Avg (Ticks)", snapshot.BidAskSpreadTicks, "F1", snapshot.AvgSpreadTicks, "F1", fontLabel, fontValue, textSecondary, textPrimary, col3X, drawY3, colWidth);
+                drawY3 += rowHeight;
+
+                DrawMetricValueRow(g, "Spread Volatility (RMS Ticks)", snapshot.SpreadVolatility, "F2", fontLabel, fontValue, textSecondary, textPrimary, col3X, drawY3, colWidth);
+                drawY3 += rowHeight;
+
+                DrawMetricValueRow(g, "Mid Realized Vol (Tick/s)", snapshot.MidRealizedVol, "F2", fontLabel, fontValue, textSecondary, textPrimary, col3X, drawY3, colWidth);
+                drawY3 += rowHeight;
+
+                DrawMetricValueRow(g, "Order Flow Speed (Ev/s)", snapshot.OrderFlowSpeed, "F1", fontLabel, fontValue, textSecondary, textPrimary, col3X, drawY3, colWidth);
+                drawY3 += rowHeight;
+
+                DrawMetricValueRow(g, "Regime Stress Score", snapshot.RegimeStress, "F2", fontLabel, fontValue, textSecondary, GetRegimeStressColor(snapshot.RegimeStress), col3X, drawY3, colWidth);
+                drawY3 += rowHeight;
+
+                string regimeText = snapshot.MarketRegime.Quality == MetricQuality.Unavailable
+                    ? "—" : RegimeLabel((int)Math.Round(snapshot.MarketRegime.Value));
+                Color regimeColor = RegimeColor((int)Math.Round(snapshot.MarketRegime.Value),
+                    snapshot.MarketRegime.Quality, accentGreen, textPrimary, accentOrange, accentRed, textSecondary);
+                DrawMetricRow(g, "Market Regime", regimeText, fontLabel, fontValue, textSecondary, regimeColor, col3X, drawY3, colWidth);
+                drawY3 += rowHeight;
+
+                DrawMetricValueRow(g, "Secs Since Regime Change", snapshot.SecondsSinceRegimeChange, "F0", fontLabel, fontValue, textSecondary, textPrimary, col3X, drawY3, colWidth);
+                drawY3 += rowHeight;
+
+                drawY3 += 7; // Separator
+
+                // Category 9: MBO Paired Floating Quote Detector
+                DrawCategoryHeader(g, "9. PAIRED FLOATING QUOTE DET.", fontCategory, col3X, drawY3, colWidth);
+                drawY3 += 17;
+
+                int pqStatus = (int)Math.Round(snapshot.PqStatus.Value);
+                DrawMetricRow(g, "Data Status", PqStatusLabel(pqStatus), fontLabel, fontValue, textSecondary,
+                    PqStatusColor(pqStatus, accentGreen, accentOrange, accentRed, textSecondary), col3X, drawY3, colWidth);
+                drawY3 += rowHeight;
+
+                DrawMetricCombinedValueRow(g, "Eligible Large Bid / Ask", snapshot.PqEligibleLargeBids, "F0", snapshot.PqEligibleLargeAsks, "F0", fontLabel, fontValue, textSecondary, textPrimary, col3X, drawY3, colWidth);
+                drawY3 += rowHeight;
+
+                DrawMetricCombinedValueRow(g, "Active / Confirmed Pairs", snapshot.PqActivePairs, "F0", snapshot.PqConfirmedPairs, "F0", fontLabel, fontValue, textSecondary, accentGreen, col3X, drawY3, colWidth);
+                drawY3 += rowHeight;
+
+                DrawMetricValueRow(g, "Top Pair Size (Lots)", snapshot.PqTopPairSize, "F0", fontLabel, fontValue, textSecondary, textPrimary, col3X, drawY3, colWidth);
+                drawY3 += rowHeight;
+
+                string pqTierText = snapshot.PqTopPairTier.Quality == MetricQuality.Unavailable
+                    ? "—" : PqTierLabel((int)Math.Round(snapshot.PqTopPairTier.Value));
+                DrawMetricRow(g, "Top Pair Tier", pqTierText, fontLabel, fontValue, textSecondary, textPrimary, col3X, drawY3, colWidth);
+                drawY3 += rowHeight;
+
+                DrawMetricCombinedValueRow(g, "Top Pair Bid / Ask Offset", snapshot.PqTopBidOffset, "F0", snapshot.PqTopAskOffset, "F0", fontLabel, fontValue, textSecondary, textPrimary, col3X, drawY3, colWidth);
+                drawY3 += rowHeight;
+
+                DrawMetricCombinedValueRow(g, "Follow Ratio / Sync Moves", snapshot.PqTopFollowRatio, "P0", snapshot.PqTopSyncMoves, "F0", fontLabel, fontValue, textSecondary, textPrimary, col3X, drawY3, colWidth);
+                drawY3 += rowHeight;
+
+                DrawMetricValueRow(g, "Paired Confidence", snapshot.PqConfidence, "P0", fontLabel, fontValue, textSecondary, accentOrange, col3X, drawY3, colWidth);
+                drawY3 += rowHeight;
 
                 // ==========================================
                 // BOTTOM DIAGNOSTIC & MONITORING PANEL
@@ -704,6 +797,73 @@ namespace MBO_Market_Data_Analytics
             if (ratio > 1.15) return accentGreen;
             if (ratio < 0.85) return accentRed;
             return textPrimary;
+        }
+
+        private Color GetRegimeStressColor(MetricValue stress)
+        {
+            if (stress.Quality == MetricQuality.Unavailable) return textSecondary;
+            if (stress.Value >= 1.50) return accentRed;
+            if (stress.Value >= 0.50) return accentOrange;
+            if (stress.Value < -0.15) return accentGreen;
+            return textPrimary;
+        }
+
+        private static string RegimeLabel(int regime)
+        {
+            switch (regime)
+            {
+                case 0: return "CALM";
+                case 1: return "NORMAL";
+                case 2: return "ACTIVE";
+                case 3: return "STRESSED";
+                default: return "—";
+            }
+        }
+
+        private static Color RegimeColor(int regime, MetricQuality quality,
+            Color calm, Color normal, Color active, Color stressed, Color unavailable)
+        {
+            if (quality == MetricQuality.Unavailable) return unavailable;
+            switch (regime)
+            {
+                case 0: return calm;
+                case 1: return normal;
+                case 2: return active;
+                case 3: return stressed;
+                default: return unavailable;
+            }
+        }
+
+        private static string PqStatusLabel(int status)
+        {
+            switch (status)
+            {
+                case 1: return "WARMING";
+                case 2: return "MBO READY";
+                case 3: return "BOOK INVALID";
+                default: return "MBP / N/A";
+            }
+        }
+
+        private static Color PqStatusColor(int status, Color ready, Color warming, Color invalid, Color na)
+        {
+            switch (status)
+            {
+                case 1: return warming;
+                case 2: return ready;
+                case 3: return invalid;
+                default: return na;
+            }
+        }
+
+        private static string PqTierLabel(int tier)
+        {
+            switch (tier)
+            {
+                case 1: return "LARGE";
+                case 2: return "VERY LARGE";
+                default: return "—";
+            }
         }
 
         private GraphicsPath GetRoundedRectPath(Rectangle bounds, int radius, bool topOnly = false)

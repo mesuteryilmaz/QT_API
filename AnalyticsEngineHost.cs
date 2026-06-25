@@ -804,7 +804,29 @@ namespace MBO_Market_Data_Analytics
                 LatticeBidRungs = calc.GetLatticeBidRungs(),
                 LatticeAskRungs = calc.GetLatticeAskRungs(),
                 LatticeSpacingTicks = calc.GetLatticeSpacingTicks(),
-                LatticeRungSize = calc.GetLatticeRungSize()
+                LatticeRungSize = calc.GetLatticeRungSize(),
+
+                BidAskSpreadTicks = calc.GetBidAskSpreadTicks(),
+                AvgSpreadTicks = calc.GetAvgSpreadTicks(),
+                SpreadVolatility = calc.GetSpreadVolatility(),
+                MidRealizedVol = calc.GetMidRealizedVol(),
+                OrderFlowSpeed = calc.GetOrderFlowSpeed(),
+                RegimeStress = calc.GetRegimeStress(),
+                MarketRegime = calc.GetMarketRegime(),
+                SecondsSinceRegimeChange = calc.GetSecondsSinceRegimeChange(),
+
+                PqStatus = calc.GetPqStatus(),
+                PqEligibleLargeBids = calc.GetPqEligibleLargeBids(),
+                PqEligibleLargeAsks = calc.GetPqEligibleLargeAsks(),
+                PqActivePairs = calc.GetPqActivePairs(),
+                PqConfirmedPairs = calc.GetPqConfirmedPairs(),
+                PqTopPairSize = calc.GetPqTopPairSize(),
+                PqTopPairTier = calc.GetPqTopPairTier(),
+                PqTopBidOffset = calc.GetPqTopBidOffset(),
+                PqTopAskOffset = calc.GetPqTopAskOffset(),
+                PqTopSyncMoves = calc.GetPqTopSyncMoves(),
+                PqTopFollowRatio = calc.GetPqTopFollowRatio(),
+                PqConfidence = calc.GetPqConfidence()
             };
 
             if (config.EnableFeatureStore && !string.IsNullOrEmpty(config.FeatureStorePath))

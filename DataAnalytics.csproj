@@ -23,6 +23,7 @@
     <Compile Include="ExecutionCore.cs" />
     <Compile Include="ShadowSimulator.cs" />
     <Compile Include="MboOrderBook.cs" />
+    <Compile Include="PairedQuoteDetector.cs" />
     <Compile Include="MboRecorder.cs" />
     <Compile Include="MboRecorderIndicator.cs" />
     <Compile Include="DataAnalyticsCalculator.cs" />

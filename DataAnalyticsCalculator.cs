@@ -225,6 +225,44 @@ namespace MBO_Market_Data_Analytics
         private long latticeLastScanTicks;
         private const long LATTICE_SCAN_INTERVAL_TICKS = 250 * TimeSpan.TicksPerMillisecond;
 
+        // -------- Market regime monitor (spread / volatility / order-flow speed / regime) --------
+        // Watches the best bid/ask spread and derives, all from EWMAs sampled on the throttled
+        // ~250ms cadence (O(1), allocation-free):
+        //   * spread (current + smoothed mean) — the cost of immediacy / liquidity premium;
+        //   * spread volatility — how much MMs are widening/jittering quotes (a risk-appetite proxy:
+        //     dealers widen when uncertain, tighten when comfortable);
+        //   * mid-price realized volatility — actual price variability;
+        //   * order-flow speed — events/sec (trades + adds + cancels), the tape's pace;
+        //   * a composite "stress" score and an ordinal regime (Calm/Normal/Active/Stressed) measured
+        //     RELATIVE to the session's own rolling baselines, so it is instrument-agnostic; plus the
+        //     time since the last regime transition.
+        // Observation-only: nothing here feeds a trade decision (audit 4a — keep analytics for research).
+        private const double REG_SPREAD_SHORT_TAU = 10.0;  // seconds — fast spread mean
+        private const double REG_SPREAD_LONG_TAU  = 300.0; // seconds — baseline spread mean
+        private const double REG_SPREAD_VAR_TAU   = 30.0;  // seconds — spread variance
+        private const double REG_RV_SHORT_TAU     = 10.0;  // seconds — fast realized variance
+        private const double REG_RV_LONG_TAU      = 300.0; // seconds — baseline realized variance
+        private const double REG_FLOW_SHORT_TAU   = 5.0;   // seconds — fast event rate
+        private const double REG_FLOW_LONG_TAU    = 300.0; // seconds — baseline event rate
+
+        private bool hasRegimeState;
+        private long regimeLastSampleTicks;
+        private double regimeEventsLast;          // cumulative event counter at last sample
+        private double spreadEwmaShort, spreadEwmaLong;
+        private double spreadVarEwma;             // EWMA variance of spread (ticks^2)
+        private double midLastTicks;              // last sampled mid (in ticks) for return calc
+        private double rvEwmaShort, rvEwmaLong;   // EWMA of mid squared-return per second (ticks^2/s)
+        private double flowRateShort, flowRateLong; // EWMA events/sec
+        private double regimeStress;              // composite excess vs baselines
+        private int regimeState, regimePrevState; // 0 Calm, 1 Normal, 2 Active, 3 Stressed
+        private long regimeLastTransitionTicks;
+        private int regimeTransitionCount;
+
+        // MBO Paired Floating Quote detector (audit 4b). Fed per-order in the MBO path; sampled on the
+        // throttled cadence. Reports Unavailable in MBP mode (no genuine per-order IDs).
+        private readonly PairedQuoteDetector pairedDetector = new PairedQuoteDetector();
+        private long pairedEpoch;
+
         // Per-price order counts (MBO mode only). Maintained in parallel with bidBook/askBook so that
         // the number of distinct orders at the best bid/ask can be read in O(1).
         private readonly Dictionary<long, int> bidCountBook = new Dictionary<long, int>();
@@ -488,6 +526,7 @@ namespace MBO_Market_Data_Analytics
                         UpdateBest(isBid, tick, nt);
                         CountBookInc(isBid, tick);
                         if (!isDuplicate) RecordL2Addition(evt.Time, evt.Price, evt.Size, isBid, orderId);
+                        pairedDetector.OnOrderUpsert(orderId, isBid, tick, (long)Math.Round(evt.Size), evt.Time.Ticks);
                         break;
                     }
                     case MboAction.Update:
@@ -531,6 +570,7 @@ namespace MBO_Market_Data_Analytics
                             CountBookInc(isBid, tick);
                             RecordL2Addition(evt.Time, evt.Price, evt.Size, isBid, orderId);
                         }
+                        pairedDetector.OnOrderUpsert(orderId, isBid, tick, (long)Math.Round(evt.Size), evt.Time.Ticks);
                         break;
                     }
                     case MboAction.Remove:
@@ -543,6 +583,7 @@ namespace MBO_Market_Data_Analytics
                             CountBookDec(o.IsBid, o.Ticks);
                             HandleL2Reduction(evt.Time, o.Ticks * ts, o.Size, o.IsBid, orderId);
                         }
+                        pairedDetector.OnOrderRemove(orderId, evt.Time.Ticks);
                         break;
                     }
                 }
@@ -592,6 +633,7 @@ namespace MBO_Market_Data_Analytics
                 var cBook = isBid ? bidCountBook : askCountBook;
                 cBook[tick] = (cBook.TryGetValue(tick, out int cx) ? cx : 0) + 1;
                 RefreshBestCounts();
+                pairedDetector.OnOrderUpsert(id, isBid, tick, (long)Math.Round(size), currentTicks);
             }
         }
 
@@ -625,11 +667,13 @@ namespace MBO_Market_Data_Analytics
             while (ofiWindow.Count > 0 && ofiWindow.Peek().ticks < ofiCutoff)
                 ofiSum -= ofiWindow.Dequeue().v;
 
-            // Throttled symmetric-lattice scan (~4/s of event time, MBO or MBP).
+            // Throttled symmetric-lattice scan + regime sample (~4/s of event time, MBO or MBP).
             if (currentTicks - latticeLastScanTicks >= LATTICE_SCAN_INTERVAL_TICKS)
             {
                 latticeLastScanTicks = currentTicks;
                 UpdateLatticeDetector();
+                UpdateRegimeMonitor();
+                pairedDetector.AdvanceTime(currentTicks, hasBestBid && hasBestAsk, bestBidTicks, bestAskTicks, PqStatus());
             }
 
             return ticks;
@@ -725,6 +769,19 @@ namespace MBO_Market_Data_Analytics
             latticePersist = 0;
             latticeLastSize = latticeLastSpacing = 0;
             latticeLastScanTicks = 0; // M-04: force a fresh scan on the next event after a reseed
+            hasRegimeState = false;
+            regimeLastSampleTicks = 0;
+            regimeEventsLast = 0;
+            spreadEwmaShort = spreadEwmaLong = 0;
+            spreadVarEwma = 0;
+            midLastTicks = 0;
+            rvEwmaShort = rvEwmaLong = 0;
+            flowRateShort = flowRateLong = 0;
+            regimeStress = 0;
+            regimeState = regimePrevState = 1;
+            regimeLastTransitionTicks = 0;
+            regimeTransitionCount = 0;
+            pairedDetector.Reset(++pairedEpoch);
             bidCountBook.Clear();
             askCountBook.Clear();
             bestBidOrderCount = 0;
@@ -763,6 +820,85 @@ namespace MBO_Market_Data_Analytics
             double persistFrac = Math.Min(1.0, latticePersist / (double)LATTICE_MIN_PERSIST);
             latticeScore = lattice.RawScore * persistFrac;
         }
+
+        // Samples spread / mid / event-rate and folds them into EWMAs, then classifies the regime.
+        // Called on the throttled cadence from AdvanceTo, under locker. Everything is time-decayed by
+        // the actual elapsed event time so quiet periods relax the fast EWMAs toward the slow ones.
+        private void UpdateRegimeMonitor()
+        {
+            if (!hasBestBid || !hasBestAsk) return;
+
+            long now = currentTicks;
+            double spreadTicks = bestAskTicks - bestBidTicks;
+            if (spreadTicks < 0) spreadTicks = 0;
+            double midTicks = (bestBidTicks + bestAskTicks) / 2.0;
+            double totalEvents = totalTradesCount + totalArrivedOrderCount + totalCancelledOrderCount;
+
+            if (!hasRegimeState)
+            {
+                spreadEwmaShort = spreadEwmaLong = spreadTicks;
+                spreadVarEwma = 0;
+                midLastTicks = midTicks;
+                rvEwmaShort = rvEwmaLong = 0;
+                flowRateShort = flowRateLong = 0;
+                regimeEventsLast = totalEvents;
+                regimeLastSampleTicks = now;
+                regimeStress = 0;
+                regimeState = regimePrevState = 1; // Normal until there is evidence otherwise
+                regimeLastTransitionTicks = now;
+                hasRegimeState = true;
+                return;
+            }
+
+            double dt = (now - regimeLastSampleTicks) / (double)TimeSpan.TicksPerSecond;
+            regimeLastSampleTicks = now;
+            if (dt <= 0) dt = 1e-3;
+
+            // Spread mean (fast + baseline) and variance.
+            spreadEwmaShort += EwmaAlpha(dt, REG_SPREAD_SHORT_TAU) * (spreadTicks - spreadEwmaShort);
+            spreadEwmaLong  += EwmaAlpha(dt, REG_SPREAD_LONG_TAU)  * (spreadTicks - spreadEwmaLong);
+            double sd = spreadTicks - spreadEwmaShort;
+            spreadVarEwma   += EwmaAlpha(dt, REG_SPREAD_VAR_TAU)   * (sd * sd - spreadVarEwma);
+
+            // Mid realized variance: squared mid return normalised to per-second.
+            double dmid = midTicks - midLastTicks;
+            midLastTicks = midTicks;
+            double r2PerSec = (dmid * dmid) / dt;
+            rvEwmaShort += EwmaAlpha(dt, REG_RV_SHORT_TAU) * (r2PerSec - rvEwmaShort);
+            rvEwmaLong  += EwmaAlpha(dt, REG_RV_LONG_TAU)  * (r2PerSec - rvEwmaLong);
+
+            // Order-flow speed: events per second.
+            double evRate = Math.Max(0.0, totalEvents - regimeEventsLast) / dt;
+            regimeEventsLast = totalEvents;
+            flowRateShort += EwmaAlpha(dt, REG_FLOW_SHORT_TAU) * (evRate - flowRateShort);
+            flowRateLong  += EwmaAlpha(dt, REG_FLOW_LONG_TAU)  * (evRate - flowRateLong);
+
+            // Composite stress: fast EWMAs measured as fractional excess over their own baselines.
+            double spreadExcess = RegimeExcess(spreadEwmaShort, spreadEwmaLong);
+            double volExcess    = RegimeExcess(Math.Sqrt(rvEwmaShort), Math.Sqrt(rvEwmaLong));
+            double flowExcess   = RegimeExcess(flowRateShort, flowRateLong);
+            regimeStress = 0.4 * spreadExcess + 0.4 * volExcess + 0.2 * flowExcess;
+
+            int newState = regimeStress < -0.15 ? 0
+                         : regimeStress < 0.50 ? 1
+                         : regimeStress < 1.50 ? 2
+                         : 3;
+            if (newState != regimeState)
+            {
+                regimePrevState = regimeState;
+                regimeState = newState;
+                regimeLastTransitionTicks = now;
+                regimeTransitionCount++;
+            }
+        }
+
+        // Time-decay EWMA weight for a sample taken dt seconds after the previous one.
+        private static double EwmaAlpha(double dt, double tauSeconds)
+            => 1.0 - Math.Exp(-dt / tauSeconds);
+
+        // Fractional excess of a fast estimate over its baseline; 0 when at baseline, +1 = 2x baseline.
+        private static double RegimeExcess(double fast, double baseline)
+            => baseline > 1e-9 ? (fast / baseline) - 1.0 : 0.0;
 
         private LatticeResult ScanSymmetricLattice()
         {
@@ -1300,6 +1436,77 @@ namespace MBO_Market_Data_Analytics
         public MetricValue GetLatticeRungSize()
             => CreateMetric(lattice.RungSize, IsL2Warm() ? MetricQuality.Derived : MetricQuality.Unavailable, IsCalibrated);
 
+        // --- 6c. Market Regime Monitor (spread / volatility / flow speed / regime) ---
+        // Current spread is exact whenever a two-sided book exists; the smoothed/derived measures
+        // become Derived once L2 is warm. Regime ordinal: 0 Calm, 1 Normal, 2 Active, 3 Stressed.
+
+        public MetricValue GetBidAskSpreadTicks()
+        {
+            double v = (hasBestBid && hasBestAsk) ? Math.Max(0, bestAskTicks - bestBidTicks) : 0;
+            return CreateMetric(v, HasTwoSidedBook ? MetricQuality.Exact : MetricQuality.Unavailable, HasTwoSidedBook);
+        }
+
+        public MetricValue GetAvgSpreadTicks()
+            => CreateMetric(spreadEwmaShort, IsL2Warm() ? MetricQuality.Derived : MetricQuality.Unavailable, IsL2Warm());
+
+        // Spread jitter (RMS) — a risk-appetite proxy: dealers widen/jitter quotes when uncertain.
+        public MetricValue GetSpreadVolatility()
+            => CreateMetric(Math.Sqrt(Math.Max(0, spreadVarEwma)), IsL2Warm() ? MetricQuality.Derived : MetricQuality.Unavailable, IsL2Warm());
+
+        // Mid-price realized volatility — RMS mid move per second, in ticks.
+        public MetricValue GetMidRealizedVol()
+            => CreateMetric(Math.Sqrt(Math.Max(0, rvEwmaShort)), IsL2Warm() ? MetricQuality.Derived : MetricQuality.Unavailable, IsL2Warm());
+
+        // Order-flow speed — trades+adds+cancels per second (the tape's pace).
+        public MetricValue GetOrderFlowSpeed()
+            => CreateMetric(flowRateShort, IsL2Warm() ? MetricQuality.Derived : MetricQuality.Unavailable, IsL2Warm());
+
+        public MetricValue GetRegimeStress()
+            => CreateMetric(regimeStress, IsL2Warm() ? MetricQuality.Derived : MetricQuality.Unavailable, IsL2Warm());
+
+        public MetricValue GetMarketRegime()
+            => CreateMetric(regimeState, IsL2Warm() ? MetricQuality.Derived : MetricQuality.Unavailable, IsL2Warm());
+
+        public MetricValue GetSecondsSinceRegimeChange()
+        {
+            double secs = (hasRegimeState && regimeLastTransitionTicks > 0)
+                ? Math.Max(0, (currentTicks - regimeLastTransitionTicks) / (double)TimeSpan.TicksPerSecond)
+                : 0;
+            return CreateMetric(secs, IsL2Warm() ? MetricQuality.Derived : MetricQuality.Unavailable, IsL2Warm());
+        }
+
+        // --- 6d. MBO Paired Floating Quote Detector (audit 4b) ---
+        // Tracks an individual same-size bid/ask order that floats through the DOM. MBO-only:
+        // reports Unavailable in MBP mode rather than a misleading zero. Status ordinal:
+        // 0 Unavailable, 1 Warming, 2 MBO-ready, 3 Book-invalid.
+
+        private PqDataStatus PqStatus()
+        {
+            if (!MboMode) return PqDataStatus.Unavailable;
+            if (!HasTwoSidedBook) return PqDataStatus.Warming;
+            return PqDataStatus.MboReady;
+        }
+
+        private bool PqReady => pairedDetector.Snapshot.Status == PqDataStatus.MboReady;
+        private MetricValue PqMetric(double v)
+            => CreateMetric(v, PqReady ? MetricQuality.Derived : MetricQuality.Unavailable, PqReady);
+
+        public MetricValue GetPqStatus()
+            => CreateMetric((int)pairedDetector.Snapshot.Status, MetricQuality.Exact, true);
+        public MetricValue GetPqEligibleLargeBids() => PqMetric(pairedDetector.Snapshot.EligibleLargeBids);
+        public MetricValue GetPqEligibleLargeAsks() => PqMetric(pairedDetector.Snapshot.EligibleLargeAsks);
+        public MetricValue GetPqVeryLargeBids() => PqMetric(pairedDetector.Snapshot.EligibleVeryLargeBids);
+        public MetricValue GetPqVeryLargeAsks() => PqMetric(pairedDetector.Snapshot.EligibleVeryLargeAsks);
+        public MetricValue GetPqActivePairs() => PqMetric(pairedDetector.Snapshot.ActivePairs);
+        public MetricValue GetPqConfirmedPairs() => PqMetric(pairedDetector.Snapshot.ConfirmedPairs);
+        public MetricValue GetPqTopPairSize() => PqMetric(pairedDetector.Snapshot.TopPairSize);
+        public MetricValue GetPqTopPairTier() => PqMetric((int)pairedDetector.Snapshot.TopPairTier);
+        public MetricValue GetPqTopBidOffset() => PqMetric(pairedDetector.Snapshot.TopPairBidOffset);
+        public MetricValue GetPqTopAskOffset() => PqMetric(pairedDetector.Snapshot.TopPairAskOffset);
+        public MetricValue GetPqTopSyncMoves() => PqMetric(pairedDetector.Snapshot.TopPairSyncMoves);
+        public MetricValue GetPqTopFollowRatio() => PqMetric(pairedDetector.Snapshot.TopPairFollowRatio);
+        public MetricValue GetPqConfidence() => PqMetric(pairedDetector.Snapshot.Confidence);
+
         // --- 6. VWAP Analytics ---
 
         public MetricValue GetRollingVwap1m() => CreateMetric(tradeAgg.Vwap(TradeWindows.S60), MetricQuality.Exact, IsTradeWarm(60));
@@ -1512,7 +1719,8 @@ private MetricValue CalculateImbalance(int levels)
             "NewOrderCount","NewBidCount","NewAskCount","NewBidVolume","NewAskVolume",
             "CancelCount","CancelBidCount","CancelAskCount","CancelBidVolume","CancelAskVolume","CancelRatio","CancelVolumeRatio",
             "DOMImbalance3","DOMImbalance5","DOMImbalance10","QueueImbalance","BookPressure",
-            "AbsorptionBuy","AbsorptionSell","IcebergScoreBid","IcebergScoreAsk","ReplenishmentBid","ReplenishmentAsk","SpoofScoreBid","SpoofScoreAsk"
+            "AbsorptionBuy","AbsorptionSell","IcebergScoreBid","IcebergScoreAsk","ReplenishmentBid","ReplenishmentAsk","SpoofScoreBid","SpoofScoreAsk",
+            "SpreadTicks","AvgSpreadTicks","SpreadVolatility","MidRealizedVol","OrderFlowSpeed","RegimeStress","MarketRegime"
         };
 
         /// <summary>
@@ -1560,7 +1768,9 @@ private MetricValue CalculateImbalance(int levels)
                 F(GetCancelRatio60().Value), F(GetCancelVolumeRatio60().Value),
                 F(GetDOMImbalance3().Value), F(GetDOMImbalance5().Value), F(GetDOMImbalance10().Value), F(GetQueueImbalance().Value), F(GetBookPressure().Value),
                 F(GetAbsorptionBuy().Value), F(GetAbsorptionSell().Value), F(GetIcebergScoreBid().Value), F(GetIcebergScoreAsk().Value),
-                F(GetReplenishmentBid().Value), F(GetReplenishmentAsk().Value), F(GetSpoofScoreBid().Value), F(GetSpoofScoreAsk().Value)
+                F(GetReplenishmentBid().Value), F(GetReplenishmentAsk().Value), F(GetSpoofScoreBid().Value), F(GetSpoofScoreAsk().Value),
+                F(GetBidAskSpreadTicks().Value), F(GetAvgSpreadTicks().Value), F(GetSpreadVolatility().Value), F(GetMidRealizedVol().Value),
+                F(GetOrderFlowSpeed().Value), F(GetRegimeStress().Value), F(GetMarketRegime().Value)
             };
             return string.Join(",", cells);
         }

@@ -1,0 +1,44 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <AssemblyName>MBO_OnePair_Grid_Strategy</AssemblyName>
+    <Version>0.1.0</Version>
+    <AssemblyVersion>0.1.0.0</AssemblyVersion>
+    <FileVersion>0.1.0.0</FileVersion>
+    <RootNamespace>MBO_OnePair_Grid_Strategy</RootNamespace>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="TradingPlatform.BusinessLayer">
+      <HintPath>C:\Quantower\TradingPlatform\v1.146.13\bin\TradingPlatform.BusinessLayer.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="src\QT.Strategies\QT.Strategies.csproj" />
+    <ProjectReference Include="src\QT.Runtime\QT.Runtime.csproj" />
+    <ProjectReference Include="DataAnalytics.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="src\QT.Quantower\Strategies\OnePairGridStrategy.cs" />
+  </ItemGroup>
+  <Target Name="PostBuild" AfterTargets="PostBuildEvent">
+    <ItemGroup>
+      <QuantowerStrategyDlls Include="$(OutputPath)$(AssemblyName).dll" />
+      <QuantowerStrategyDlls Include="$(OutputPath)QT_API.V2.Strategies.dll" />
+      <!-- Analytics host + its support assemblies power the advisor gate at runtime. -->
+      <QuantowerStrategyDlls Include="$(OutputPath)MBO_Market_Data_Analytics.dll" />
+      <QuantowerStrategyDlls Include="$(OutputPath)QT_API.V2.Core.dll" />
+      <QuantowerStrategyDlls Include="$(OutputPath)QT_API.V2.Market.dll" />
+      <QuantowerStrategyDlls Include="$(OutputPath)QT_API.V2.Features.dll" />
+      <QuantowerStrategyDlls Include="$(OutputPath)QT_API.V2.Storage.dll" />
+      <QuantowerStrategyDlls Include="$(OutputPath)QT_API.V2.Runtime.dll" />
+    </ItemGroup>
+    <Copy SourceFiles="@(QuantowerStrategyDlls)" DestinationFolder="C:\Quantower\Settings\Scripts\Strategies\" SkipUnchangedFiles="false" />
+  </Target>
+</Project>

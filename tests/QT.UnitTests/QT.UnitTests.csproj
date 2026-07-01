@@ -21,6 +21,7 @@
     <ProjectReference Include="..\..\src\QT.Runtime\QT.Runtime.csproj" />
     <ProjectReference Include="..\..\src\QT.Simulation\QT.Simulation.csproj" />
     <ProjectReference Include="..\..\src\QT.Execution\QT.Execution.csproj" />
+    <ProjectReference Include="..\..\src\QT.Strategies\QT.Strategies.csproj" />
   </ItemGroup>
   <ItemGroup>
     <Reference Include="TradingPlatform.BusinessLayer">

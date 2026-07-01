@@ -56,6 +56,7 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
     private int exitCount;
     private int flattenCount;
     private int heartbeatEveryCycles = 40;
+    private DateTime lastStopModifyUtc = DateTime.MinValue;
 
     [InputParameter("Symbol", 0)]
     public Symbol CurrentSymbol { get; set; } = null!;
@@ -94,6 +95,9 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
 
     [InputParameter("Flatten on stop", 10)]
     public bool FlattenOnStop { get; set; } = true;
+
+    [InputParameter("Trail update step ticks", 11, minimum: 1, maximum: 500, increment: 1, decimalPlaces: 0)]
+    public int TrailUpdateTicks { get; set; } = 4;
 
     public override string[] MonitoringConnectionsIds
     {
@@ -134,6 +138,7 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
             hardStopPrice = 0;
             stopOrder = null;
             stopOrderId = null;
+            lastStopModifyUtc = DateTime.MinValue;
             cycleCount = 0;
             baseEntryCount = 0;
             addCount = 0;
@@ -465,13 +470,30 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
         }
 
         double currentTrigger = stopOrder.TriggerPrice;
-        bool ratchets = positionSide == Side.Buy
-            ? desired >= currentTrigger + tick / 2.0
-            : desired <= currentTrigger - tick / 2.0;
         bool qtyChanged = Math.Abs(stopOrder.TotalQuantity - qty) > 0.0001;
 
-        if (ratchets || qtyChanged)
+        // A quantity change (a new lot to protect) must apply immediately.
+        if (qtyChanged)
+        {
             ModifyStop(stopOrder, qty, desired);
+            lastStopModifyUtc = Core.Instance.TimeUtils.DateTimeUtcNow;
+            return;
+        }
+
+        // Otherwise only re-trail on a meaningful favorable step, throttled to ~1/sec. Re-pricing the
+        // stop every tick hammered the broker (30+ modifies/min) and left it perpetually in-flight,
+        // which can miss triggers. The stop only ever moves in the favorable direction.
+        double improvement = positionSide == Side.Buy
+            ? desired - currentTrigger
+            : currentTrigger - desired;
+        bool bigEnoughStep = improvement >= TrailUpdateTicks * tick;
+        bool throttleElapsed = Core.Instance.TimeUtils.DateTimeUtcNow - lastStopModifyUtc >= TimeSpan.FromSeconds(1);
+
+        if (bigEnoughStep && throttleElapsed)
+        {
+            ModifyStop(stopOrder, qty, desired);
+            lastStopModifyUtc = Core.Instance.TimeUtils.DateTimeUtcNow;
+        }
     }
 
     private bool PlaceMarket(Side side, double quantity, string tag)

@@ -25,6 +25,16 @@ public sealed class OnePairGridStrategy : Strategy, ICurrentAccount, ICurrentSym
     private int gatePullCount;
     private int gateWarmupCount;
 
+    private GridMode mode = GridMode.Quoting;
+    private Order? stopOrder;
+    private string? stopOrderId;
+    private Side positionSide;
+    private double positionEntryPrice;
+    private double positionQuantity;
+    private string stopOrderTypeId = OrderType.Stop;
+    private int fillCount;
+    private int flattenCount;
+
     private System.Threading.Timer? timer;
     private Order? bidOrder;
     private Order? askOrder;
@@ -45,6 +55,12 @@ public sealed class OnePairGridStrategy : Strategy, ICurrentAccount, ICurrentSym
     private long lastAskTicks;
     private long lastWidthTicks;
     private long nextLatencyOperationId;
+
+    private enum GridMode
+    {
+        Quoting,
+        Managing
+    }
 
     [InputParameter("Symbol", 0)]
     public Symbol CurrentSymbol { get; set; } = null!;
@@ -91,6 +107,18 @@ public sealed class OnePairGridStrategy : Strategy, ICurrentAccount, ICurrentSym
     [InputParameter("Analytics prefer MBO", 14)]
     public bool AnalyticsPreferMbo { get; set; } = true;
 
+    [InputParameter("Stop loss ticks", 15, minimum: 1, maximum: 4000, increment: 1, decimalPlaces: 0)]
+    public int StopLossTicks { get; set; } = 40;
+
+    [InputParameter("Take profit ticks (0 = pair width)", 16, minimum: 0, maximum: 4000, increment: 1, decimalPlaces: 0)]
+    public int TakeProfitTicks { get; set; }
+
+    [InputParameter("Use stop-market SL", 17)]
+    public bool UseStopMarket { get; set; } = true;
+
+    [InputParameter("Flatten on advisor risk-off", 18)]
+    public bool FlattenOnAdvisorRiskOff { get; set; } = true;
+
     public override string[] MonitoringConnectionsIds
     {
         get
@@ -121,6 +149,14 @@ public sealed class OnePairGridStrategy : Strategy, ICurrentAccount, ICurrentSym
         lastAdvice = null;
         gatePullCount = 0;
         gateWarmupCount = 0;
+        mode = GridMode.Quoting;
+        stopOrder = null;
+        stopOrderId = null;
+        positionSide = default;
+        positionEntryPrice = 0;
+        positionQuantity = 0;
+        fillCount = 0;
+        flattenCount = 0;
 
         lock (sync)
         {
@@ -160,6 +196,9 @@ public sealed class OnePairGridStrategy : Strategy, ICurrentAccount, ICurrentSym
         }
 
         orderTypeId = Core.OrderTypes.FirstOrDefault(x => x.ConnectionId == CurrentSymbol.ConnectionId && x.Behavior == OrderTypeBehavior.Limit)?.Id ?? OrderType.Limit;
+        var stopBehavior = UseStopMarket ? OrderTypeBehavior.Stop : OrderTypeBehavior.StopLimit;
+        stopOrderTypeId = Core.OrderTypes.FirstOrDefault(x => x.ConnectionId == CurrentSymbol.ConnectionId && x.Behavior == stopBehavior)?.Id
+            ?? (UseStopMarket ? OrderType.Stop : OrderType.StopLimit);
 
         if (HasOpenPosition())
         {
@@ -235,6 +274,8 @@ public sealed class OnePairGridStrategy : Strategy, ICurrentAccount, ICurrentSym
         meter.CreateObservableCounter("grid-skips", () => skipCount, description: "Skipped quote cycles");
         meter.CreateObservableCounter("grid-position-halts", () => positionHaltCount, description: "Halts caused by detected position");
         meter.CreateObservableCounter("grid-analytics-pulls", () => gatePullCount, description: "Cycles where the analytics advisor withheld or pulled quotes");
+        meter.CreateObservableCounter("grid-fills", () => fillCount, description: "Leg fills that opened a managed position");
+        meter.CreateObservableCounter("grid-flattens", () => flattenCount, description: "Forced market-flattens (SL failure or advisor risk-off)");
     }
 
     private bool ValidateInputs()
@@ -294,11 +335,18 @@ public sealed class OnePairGridStrategy : Strategy, ICurrentAccount, ICurrentSym
 
             cycleCount++;
 
-            if (HasOpenPosition())
+            if (mode == GridMode.Managing)
             {
-                positionHaltCount++;
-                CancelOwnedPair("position detected");
-                Halt("position detected; quoting halted");
+                ManageInventory();
+                return;
+            }
+
+            // QUOTING: a fill may have arrived without a position event (safety net).
+            var existingPosition = GetOwnedPosition();
+            if (existingPosition != null)
+            {
+                EnterManaging(existingPosition, "position detected on timer");
+                ManageInventory();
                 return;
             }
 
@@ -345,6 +393,250 @@ public sealed class OnePairGridStrategy : Strategy, ICurrentAccount, ICurrentSym
             EnsureSide(Side.Sell, ref askOrder, ref askOrderId, decision.AskOrderTicks, tickSize);
         }
     }
+
+    private void Core_PositionAdded(Position position)
+    {
+        if (position.Symbol != CurrentSymbol || position.Account != CurrentAccount)
+            return;
+
+        lock (sync)
+        {
+            if (halted || mode == GridMode.Managing)
+                return;
+
+            EnterManaging(position, "position event");
+        }
+    }
+
+    private void Core_PositionRemoved(Position position)
+    {
+        if (position.Symbol != CurrentSymbol || position.Account != CurrentAccount)
+            return;
+
+        lock (sync)
+        {
+            if (mode != GridMode.Managing)
+                return;
+
+            if (GetOwnedPosition() != null)
+                return; // still holding (net not flat); keep managing
+
+            ExitManaging("position removed");
+        }
+    }
+
+    /// <summary>
+    /// Transition from quoting to managing an open position: keep the resting opposite leg as the
+    /// take-profit, then place the protective stop. Called under <see cref="sync"/>.
+    /// </summary>
+    private void EnterManaging(Position position, string reason)
+    {
+        mode = GridMode.Managing;
+        fillCount++;
+        positionSide = position.Side;
+        positionQuantity = Math.Abs(position.Quantity);
+        positionEntryPrice = position.OpenPrice;
+
+        // The filled leg is gone; drop its stale reference. The opposite leg stays as the TP.
+        if (positionSide == Side.Buy)
+        {
+            bidOrder = null;
+            bidOrderId = null;
+        }
+        else
+        {
+            askOrder = null;
+            askOrderId = null;
+        }
+
+        Log($"Fill detected ({reason}): {positionSide} {positionQuantity} @ {positionEntryPrice}; managing with TP + SL.", StrategyLoggingLevel.Trading);
+
+        if (!PlaceStopLoss())
+            return;
+
+        EnsureTakeProfit();
+    }
+
+    private void ManageInventory()
+    {
+        var pos = GetOwnedPosition();
+        if (pos == null)
+        {
+            ExitManaging("position closed (TP/SL)");
+            return;
+        }
+
+        positionSide = pos.Side;
+        positionQuantity = Math.Abs(pos.Quantity);
+        positionEntryPrice = pos.OpenPrice;
+
+        RefreshBracketReferences();
+
+        // Fail-safe: if the protective stop vanished while still holding, replace it (flattens on failure).
+        if (stopOrder == null && FindOpenOrderById(stopOrderId) == null && !PlaceStopLoss())
+            return;
+
+        EnsureTakeProfit();
+
+        // Advisor risk-off: force-exit inventory on regime deterioration, overriding TP/SL.
+        if (FlattenOnAdvisorRiskOff && analytics != null)
+        {
+            var snapshot = analytics.CurrentSnapshot;
+            if (snapshot != null && analytics.IsInitialized)
+            {
+                var advice = advisor.Evaluate(MarketView.From(snapshot), AnalyticsEvents.None);
+                lastAdvice = advice;
+                if (advice.Posture == TradingPosture.Flatten)
+                    FlattenPosition($"advisor risk-off: {advice.Reason}");
+            }
+        }
+    }
+
+    private void ExitManaging(string reason)
+    {
+        CancelBracket(reason);
+        mode = GridMode.Quoting;
+        positionSide = default;
+        positionEntryPrice = 0;
+        positionQuantity = 0;
+        Log($"Position closed ({reason}); re-armed to quoting.", StrategyLoggingLevel.Trading);
+    }
+
+    /// <summary>
+    /// Places a stop order to close the open position. Returns false (after market-flattening) if the
+    /// stop cannot be placed, so the caller never proceeds to hold a position without protection.
+    /// </summary>
+    private bool PlaceStopLoss()
+    {
+        var pos = GetOwnedPosition();
+        if (pos == null)
+            return false;
+
+        Side closeSide = positionSide == Side.Buy ? Side.Sell : Side.Buy;
+        double offset = StopLossTicks * CurrentSymbol.TickSize;
+        double triggerPrice = CurrentSymbol.RoundPriceToTickSize(
+            positionSide == Side.Buy ? positionEntryPrice - offset : positionEntryPrice + offset);
+
+        var request = new PlaceOrderRequestParameters
+        {
+            Account = CurrentAccount,
+            Symbol = CurrentSymbol,
+            Side = closeSide,
+            OrderTypeId = stopOrderTypeId,
+            Quantity = positionQuantity,
+            TriggerPrice = triggerPrice,
+            TimeInForce = TimeInForce.GTC,
+            Comment = $"{commentPrefix} SL"
+        };
+        if (!UseStopMarket)
+            request.Price = triggerPrice;
+
+        var result = Core.Instance.PlaceOrder(request);
+        if (result.Status == TradingOperationResultStatus.Failure)
+        {
+            Log($"SL placement failed ({(string.IsNullOrWhiteSpace(result.Message) ? result.Status.ToString() : result.Message)}); flattening.", StrategyLoggingLevel.Error);
+            FlattenPosition("stop-loss placement failed");
+            return false;
+        }
+
+        stopOrderId = result.OrderId;
+        stopOrder = FindOpenOrderById(result.OrderId);
+        if (stopOrder != null)
+            SubscribeOrderUpdates(stopOrder);
+
+        Log($"Placed {closeSide} stop-{(UseStopMarket ? "market" : "limit")} SL @ {triggerPrice} for {positionSide} {positionQuantity}.", StrategyLoggingLevel.Trading);
+        return true;
+    }
+
+    /// <summary>
+    /// Keeps the resting opposite leg as the take-profit; if it is missing, places a fallback TP limit
+    /// at <see cref="TakeProfitTicks"/> (or the pair width when zero) from the entry.
+    /// </summary>
+    private void EnsureTakeProfit()
+    {
+        if (GetOwnedPosition() == null)
+            return;
+
+        Side tpSide = positionSide == Side.Buy ? Side.Sell : Side.Buy;
+        if (tpSide == Side.Sell)
+        {
+            askOrder = RefreshSideReference(Side.Sell, askOrder, askOrderId);
+            if (askOrder != null)
+            {
+                askOrderId = OrderIdentity(askOrder) ?? askOrderId;
+                return;
+            }
+        }
+        else
+        {
+            bidOrder = RefreshSideReference(Side.Buy, bidOrder, bidOrderId);
+            if (bidOrder != null)
+            {
+                bidOrderId = OrderIdentity(bidOrder) ?? bidOrderId;
+                return;
+            }
+        }
+
+        long tpTicks = TakeProfitTicks > 0 ? TakeProfitTicks : TargetPairWidthTicks;
+        double tpOffset = tpTicks * CurrentSymbol.TickSize;
+        double tpPrice = positionSide == Side.Buy ? positionEntryPrice + tpOffset : positionEntryPrice - tpOffset;
+
+        var placed = PlaceLimit(tpSide, tpPrice);
+        if (tpSide == Side.Sell)
+        {
+            askOrder = placed.Order;
+            askOrderId = placed.OrderId;
+        }
+        else
+        {
+            bidOrder = placed.Order;
+            bidOrderId = placed.OrderId;
+        }
+    }
+
+    private void FlattenPosition(string reason)
+    {
+        var pos = GetOwnedPosition();
+        if (pos != null)
+        {
+            var result = pos.Close();
+            flattenCount++;
+            if (result.Status == TradingOperationResultStatus.Failure)
+                Log($"Flatten failed ({reason}): {(string.IsNullOrWhiteSpace(result.Message) ? result.Status.ToString() : result.Message)}", StrategyLoggingLevel.Error);
+            else
+                Log($"Flattened position ({reason}).", StrategyLoggingLevel.Trading);
+        }
+
+        CancelBracket(reason);
+        // PositionRemoved (or the next timer tick) re-arms to quoting once flat.
+    }
+
+    private void CancelBracket(string reason)
+    {
+        if (stopOrder != null)
+            CancelOrder(stopOrder, reason);
+        else if (!string.IsNullOrWhiteSpace(stopOrderId))
+            CancelOrder(FindOpenOrderById(stopOrderId), reason);
+
+        stopOrder = null;
+        stopOrderId = null;
+
+        CancelOwnedPair(reason);
+    }
+
+    private void RefreshBracketReferences()
+    {
+        if (stopOrder != null && !IsOpen(stopOrder))
+            stopOrder = null;
+
+        stopOrder ??= FindOpenOrderById(stopOrderId);
+        if (stopOrder != null)
+            SubscribeOrderUpdates(stopOrder);
+    }
+
+    private Position? GetOwnedPosition()
+        => Core.Instance.Positions.FirstOrDefault(p =>
+            p.Symbol == CurrentSymbol && p.Account == CurrentAccount && Math.Abs(p.Quantity) > 0);
 
     /// <summary>
     /// Consults the analytics advisor. Returns true only when quoting is permitted. While analytics
@@ -633,6 +925,8 @@ public sealed class OnePairGridStrategy : Strategy, ICurrentAccount, ICurrentSym
         Core.OrderAdded += Core_OrderAdded;
         Core.OrderRemoved += Core_OrderRemoved;
         Core.OrdersHistoryAdded += Core_OrdersHistoryAdded;
+        Core.PositionAdded += Core_PositionAdded;
+        Core.PositionRemoved += Core_PositionRemoved;
         coreEventsSubscribed = true;
     }
 
@@ -644,6 +938,8 @@ public sealed class OnePairGridStrategy : Strategy, ICurrentAccount, ICurrentSym
         Core.OrderAdded -= Core_OrderAdded;
         Core.OrderRemoved -= Core_OrderRemoved;
         Core.OrdersHistoryAdded -= Core_OrdersHistoryAdded;
+        Core.PositionAdded -= Core_PositionAdded;
+        Core.PositionRemoved -= Core_PositionRemoved;
         coreEventsSubscribed = false;
     }
 

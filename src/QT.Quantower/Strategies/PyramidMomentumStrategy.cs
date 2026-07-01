@@ -3,8 +3,6 @@ using System.Collections.Generic;
 using System.Diagnostics.Metrics;
 using System.Globalization;
 using System.Linq;
-using MBO_Market_Data_Analytics;
-using QT.Strategies.Advisory;
 using TradingPlatform.BusinessLayer;
 
 namespace MBO_OnePair_Grid_Strategy;
@@ -13,9 +11,9 @@ namespace MBO_OnePair_Grid_Strategy;
 /// Anti-martingale (pyramiding) momentum strategy. A manual directional bias fires an aggressive
 /// market entry; the position adds one lot per favorable step up to a hard exposure cap, and the
 /// whole stack is protected by a single ratcheting trailing stop plus a base hard stop. It never
-/// averages down — adds happen only in profit. The analytics advisor is used for risk-off only:
-/// a Flatten posture force-closes the stack and blocks new entries. Direction is intentionally
-/// manual because the analytics layer exposes no directional signal with established edge.
+/// averages down — adds happen only in profit. Direction is intentionally manual. Deliberately
+/// self-contained: it takes no dependency on the analytics/indicator assembly, so it cannot bind
+/// to a stale shared-assembly copy across Quantower script folders.
 /// </summary>
 public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurrentSymbol
 {
@@ -33,8 +31,6 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
     }
 
     private readonly object sync = new();
-    private readonly IAnalyticsAdvisor advisor = new RegimeGatedAdvisor();
-    private AnalyticsEngineHost? analytics;
     private System.Threading.Timer? timer;
 
     private TradeState state = TradeState.Flat;
@@ -60,6 +56,7 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
     private int addCount;
     private int exitCount;
     private int flattenCount;
+    private int heartbeatEveryCycles = 40;
 
     [InputParameter("Symbol", 0)]
     public Symbol CurrentSymbol { get; set; } = null!;
@@ -91,16 +88,7 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
     [InputParameter("Refresh (ms)", 9, minimum: 50, maximum: 5000, increment: 50, decimalPlaces: 0)]
     public int RefreshMs { get; set; } = 250;
 
-    [InputParameter("Enable analytics gate", 10)]
-    public bool EnableAnalyticsGate { get; set; } = true;
-
-    [InputParameter("Analytics prefer MBO", 11)]
-    public bool AnalyticsPreferMbo { get; set; } = true;
-
-    [InputParameter("Flatten on advisor risk-off", 12)]
-    public bool FlattenOnAdvisorRiskOff { get; set; } = true;
-
-    [InputParameter("Flatten on stop", 13)]
+    [InputParameter("Flatten on stop", 10)]
     public bool FlattenOnStop { get; set; } = true;
 
     public override string[] MonitoringConnectionsIds
@@ -127,9 +115,6 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
     {
         base.OnRun();
         UnsubscribeCoreEvents();
-
-        analytics?.Stop();
-        analytics = null;
 
         lock (sync)
         {
@@ -182,24 +167,10 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
 
         SubscribeCoreEvents();
 
-        if (EnableAnalyticsGate)
-        {
-            try
-            {
-                analytics = new AnalyticsEngineHost(CurrentSymbol, new AnalyticsEngineConfig { PreferMbo = AnalyticsPreferMbo }, MapAnalyticsLog);
-                analytics.Start();
-            }
-            catch (Exception ex)
-            {
-                analytics = null;
-                Halt($"analytics gate failed to start: {ex.Message}");
-                return;
-            }
-        }
-
         int period = Math.Max(50, RefreshMs);
+        heartbeatEveryCycles = Math.Max(1, 10000 / period);
         timer = new System.Threading.Timer(_ => OnTimer(), null, 0, period);
-        Log($"Started pyramid momentum strategy: maxContracts={MaxContracts}, addStep={AddStepTicks}t, trail={TrailTicks}t, hardSL={StopLossTicks}t, refresh={period}ms.");
+        Log($"Started pyramid momentum strategy: maxContracts={MaxContracts}, addStep={AddStepTicks}t, trail={TrailTicks}t, hardSL={StopLossTicks}t, refresh={period}ms. Set 'Directional bias' to Long/Short to enter.");
     }
 
     protected override void OnStop()
@@ -217,8 +188,6 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
             Log("Strategy stopped without flattening; existing position and stop remain live at the broker.", StrategyLoggingLevel.Error);
         }
 
-        analytics?.Stop();
-        analytics = null;
         base.OnStop();
     }
 
@@ -228,8 +197,6 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
         timer = null;
         lock (sync)
             FlattenAll("strategy remove");
-        analytics?.Stop();
-        analytics = null;
         UnsubscribeCoreEvents();
         base.OnRemove();
     }
@@ -241,7 +208,7 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
         meter.CreateObservableCounter("pyramid-base-entries", () => baseEntryCount, description: "Base entries fired");
         meter.CreateObservableCounter("pyramid-adds", () => addCount, description: "Pyramided add lots");
         meter.CreateObservableCounter("pyramid-exits", () => exitCount, description: "Completed trade exits");
-        meter.CreateObservableCounter("pyramid-flattens", () => flattenCount, description: "Forced flattens (advisor risk-off / stop failure)");
+        meter.CreateObservableCounter("pyramid-flattens", () => flattenCount, description: "Forced flattens (stop-placement failure / management error)");
     }
 
     private bool ValidateInputs()
@@ -287,12 +254,41 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
 
     private void OnTimer()
     {
+        // A System.Threading.Timer callback runs on a thread-pool thread; an exception that escapes
+        // here would be unhandled and terminate the whole Quantower process. Contain it: on any error
+        // flatten and halt, never let it reach the host.
+        try
+        {
+            OnTimerCore();
+        }
+        catch (Exception ex)
+        {
+            Log($"Pyramid management loop error; flattening and halting: {ex}", StrategyLoggingLevel.Error);
+            try
+            {
+                lock (sync)
+                    FlattenAll("management loop exception");
+            }
+            catch (Exception flattenEx)
+            {
+                Log($"Flatten after loop error also failed: {flattenEx}", StrategyLoggingLevel.Error);
+            }
+            halted = true;
+            Stop();
+        }
+    }
+
+    private void OnTimerCore()
+    {
         lock (sync)
         {
             if (halted)
                 return;
 
             cycleCount++;
+            if (cycleCount % heartbeatEveryCycles == 0)
+                LogHeartbeat();
+
             var pos = GetOwnedPosition();
 
             if (state == TradeState.Flat)
@@ -332,8 +328,30 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
             UpdateHighWater();
             MaybeAdd(pos);
             UpdateProtectiveStop();
-            AdvisorFlattenCheck();
         }
+    }
+
+    private void LogHeartbeat()
+    {
+        double mid = Mid();
+        string midStr = double.IsNaN(mid) ? "n/a" : mid.ToString("0.##", CultureInfo.InvariantCulture);
+
+        if (state == TradeState.Flat)
+        {
+            string reason = Bias == TradeBias.Off ? "no bias set — idle"
+                : consumed ? "armed & consumed (toggle bias Off->Long/Short to re-arm)"
+                : double.IsNaN(mid) ? "waiting for quotes"
+                : "ready — will enter on next cycle";
+            Log($"Heartbeat: FLAT | bias={Bias} | mid={midStr} | cycles={cycleCount} | {reason}.", StrategyLoggingLevel.Trading);
+            return;
+        }
+
+        var pos = GetOwnedPosition();
+        int qty = pos != null ? (int)Math.Round(Math.Abs(pos.Quantity)) : 0;
+        string stopStr = stopOrder != null && IsOpen(stopOrder)
+            ? stopOrder.TriggerPrice.ToString("0.##", CultureInfo.InvariantCulture)
+            : "none";
+        Log($"Heartbeat: IN-TRADE {positionSide} {qty}/{MaxContracts} | entry={baseEntryPrice.ToString("0.##", CultureInfo.InvariantCulture)} | mid={midStr} | high={highWaterPrice.ToString("0.##", CultureInfo.InvariantCulture)} | stop={stopStr} | cycles={cycleCount}.", StrategyLoggingLevel.Trading);
     }
 
     private void TryEnterBase()
@@ -349,20 +367,6 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
 
         if (double.IsNaN(Mid()))
             return;
-
-        if (EnableAnalyticsGate && analytics != null)
-        {
-            var snapshot = analytics.CurrentSnapshot;
-            if (snapshot == null || !analytics.IsInitialized)
-                return; // wait for analytics warmup before entering
-
-            var advice = advisor.Evaluate(MarketView.From(snapshot), AnalyticsEvents.None);
-            if (advice.Posture == TradingPosture.Flatten)
-            {
-                Log($"Entry blocked by advisor risk-off: {advice.Reason}", StrategyLoggingLevel.Trading);
-                return;
-            }
-        }
 
         Side side = Bias == TradeBias.Long ? Side.Buy : Side.Sell;
         if (!PlaceMarket(side, 1, "BASE"))
@@ -463,32 +467,29 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
             ModifyStop(stopOrder, qty, desired);
     }
 
-    private void AdvisorFlattenCheck()
-    {
-        if (!FlattenOnAdvisorRiskOff || analytics == null)
-            return;
-
-        var snapshot = analytics.CurrentSnapshot;
-        if (snapshot == null || !analytics.IsInitialized)
-            return;
-
-        var advice = advisor.Evaluate(MarketView.From(snapshot), AnalyticsEvents.None);
-        if (advice.Posture == TradingPosture.Flatten)
-            FlattenAll($"advisor risk-off: {advice.Reason}");
-    }
-
     private bool PlaceMarket(Side side, double quantity, string tag)
     {
-        var result = Core.Instance.PlaceOrder(new PlaceOrderRequestParameters
+        TradingOperationResult result;
+        try
         {
-            Account = CurrentAccount,
-            Symbol = CurrentSymbol,
-            Side = side,
-            OrderTypeId = marketOrderTypeId,
-            Quantity = quantity,
-            TimeInForce = TimeInForce.GTC,
-            Comment = $"{commentPrefix} {tag}"
-        });
+            result = Core.Instance.PlaceOrder(new PlaceOrderRequestParameters
+            {
+                Account = CurrentAccount,
+                Symbol = CurrentSymbol,
+                Side = side,
+                OrderTypeId = marketOrderTypeId,
+                Quantity = quantity,
+                TimeInForce = TimeInForce.GTC,
+                Comment = $"{commentPrefix} {tag}"
+            });
+        }
+        catch (Exception ex)
+        {
+            Log($"{tag} market {side} threw: {ex.Message}", StrategyLoggingLevel.Error);
+            if (tag == "BASE")
+                Halt($"base entry threw: {ex.Message}");
+            return false;
+        }
 
         if (result.Status == TradingOperationResultStatus.Failure)
         {
@@ -503,17 +504,27 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
 
     private void PlaceStop(Side closeSide, int quantity, double triggerPrice)
     {
-        var result = Core.Instance.PlaceOrder(new PlaceOrderRequestParameters
+        TradingOperationResult result;
+        try
         {
-            Account = CurrentAccount,
-            Symbol = CurrentSymbol,
-            Side = closeSide,
-            OrderTypeId = stopOrderTypeId,
-            Quantity = quantity,
-            TriggerPrice = triggerPrice,
-            TimeInForce = TimeInForce.GTC,
-            Comment = $"{commentPrefix} STOP"
-        });
+            result = Core.Instance.PlaceOrder(new PlaceOrderRequestParameters
+            {
+                Account = CurrentAccount,
+                Symbol = CurrentSymbol,
+                Side = closeSide,
+                OrderTypeId = stopOrderTypeId,
+                Quantity = quantity,
+                TriggerPrice = triggerPrice,
+                TimeInForce = TimeInForce.GTC,
+                Comment = $"{commentPrefix} STOP"
+            });
+        }
+        catch (Exception ex)
+        {
+            Log($"Protective stop placement threw ({ex.Message}); flattening.", StrategyLoggingLevel.Error);
+            FlattenAll("protective stop placement threw");
+            return;
+        }
 
         if (result.Status == TradingOperationResultStatus.Failure)
         {
@@ -529,15 +540,22 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
 
     private void ModifyStop(Order order, int quantity, double triggerPrice)
     {
-        var result = Core.Instance.ModifyOrder(new ModifyOrderRequestParameters(order)
+        try
         {
-            Quantity = quantity,
-            TriggerPrice = triggerPrice,
-            TimeInForce = TimeInForce.GTC
-        });
+            var result = Core.Instance.ModifyOrder(new ModifyOrderRequestParameters(order)
+            {
+                Quantity = quantity,
+                TriggerPrice = triggerPrice,
+                TimeInForce = TimeInForce.GTC
+            });
 
-        if (result.Status == TradingOperationResultStatus.Failure)
-            Log($"Protective stop modify failed: {(string.IsNullOrWhiteSpace(result.Message) ? result.Status.ToString() : result.Message)}", StrategyLoggingLevel.Error);
+            if (result.Status == TradingOperationResultStatus.Failure)
+                Log($"Protective stop modify failed: {(string.IsNullOrWhiteSpace(result.Message) ? result.Status.ToString() : result.Message)}", StrategyLoggingLevel.Error);
+        }
+        catch (Exception ex)
+        {
+            Log($"Protective stop modify threw: {ex.Message}", StrategyLoggingLevel.Error);
+        }
     }
 
     private void FlattenAll(string reason)
@@ -547,12 +565,19 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
         var pos = GetOwnedPosition();
         if (pos != null)
         {
-            var result = pos.Close();
-            flattenCount++;
-            if (result.Status == TradingOperationResultStatus.Failure)
-                Log($"Flatten failed ({reason}): {(string.IsNullOrWhiteSpace(result.Message) ? result.Status.ToString() : result.Message)}", StrategyLoggingLevel.Error);
-            else
-                Log($"Flattened stack ({reason}).", StrategyLoggingLevel.Trading);
+            try
+            {
+                var result = pos.Close();
+                flattenCount++;
+                if (result.Status == TradingOperationResultStatus.Failure)
+                    Log($"Flatten failed ({reason}): {(string.IsNullOrWhiteSpace(result.Message) ? result.Status.ToString() : result.Message)}", StrategyLoggingLevel.Error);
+                else
+                    Log($"Flattened stack ({reason}).", StrategyLoggingLevel.Trading);
+            }
+            catch (Exception ex)
+            {
+                Log($"Flatten threw ({reason}): {ex.Message}", StrategyLoggingLevel.Error);
+            }
         }
 
         ResetToFlat(reason);
@@ -581,9 +606,16 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
         var order = (stopOrder != null && IsOpen(stopOrder)) ? stopOrder : FindOpenOrderById(stopOrderId);
         if (order != null && IsOpen(order))
         {
-            var result = order.Cancel(commentPrefix);
-            if (result.Status == TradingOperationResultStatus.Failure)
-                Log($"Stop cancel failed ({reason}): {(string.IsNullOrWhiteSpace(result.Message) ? result.Status.ToString() : result.Message)}", StrategyLoggingLevel.Error);
+            try
+            {
+                var result = order.Cancel(commentPrefix);
+                if (result.Status == TradingOperationResultStatus.Failure)
+                    Log($"Stop cancel failed ({reason}): {(string.IsNullOrWhiteSpace(result.Message) ? result.Status.ToString() : result.Message)}", StrategyLoggingLevel.Error);
+            }
+            catch (Exception ex)
+            {
+                Log($"Stop cancel threw ({reason}): {ex.Message}", StrategyLoggingLevel.Error);
+            }
         }
 
         stopOrder = null;
@@ -592,17 +624,25 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
 
     private void Core_PositionRemoved(Position position)
     {
-        if (position.Symbol != CurrentSymbol || position.Account != CurrentAccount)
-            return;
-
-        lock (sync)
+        // Runs on a Quantower callback thread; never let an exception escape into the host.
+        try
         {
-            if (state != TradeState.InTrade)
-                return;
-            if (GetOwnedPosition() != null)
+            if (position.Symbol != CurrentSymbol || position.Account != CurrentAccount)
                 return;
 
-            ResetToFlat("position removed");
+            lock (sync)
+            {
+                if (state != TradeState.InTrade)
+                    return;
+                if (GetOwnedPosition() != null)
+                    return;
+
+                ResetToFlat("position removed");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log($"Position-removed handler error: {ex}", StrategyLoggingLevel.Error);
         }
     }
 
@@ -623,9 +663,6 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
         Core.PositionRemoved -= Core_PositionRemoved;
         coreEventsSubscribed = false;
     }
-
-    private void MapAnalyticsLog(string message, LoggingLevel level)
-        => Log(message, level == LoggingLevel.Error ? StrategyLoggingLevel.Error : StrategyLoggingLevel.Info);
 
     private double Mid()
     {

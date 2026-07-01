@@ -26,6 +26,7 @@
   </ItemGroup>
   <ItemGroup>
     <Compile Include="src\QT.Quantower\Strategies\OnePairGridStrategy.cs" />
+    <Compile Include="src\QT.Quantower\Strategies\PyramidMomentumStrategy.cs" />
   </ItemGroup>
   <Target Name="PostBuild" AfterTargets="PostBuildEvent">
     <ItemGroup>

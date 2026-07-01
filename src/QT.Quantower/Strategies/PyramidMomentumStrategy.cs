@@ -17,12 +17,11 @@ namespace MBO_OnePair_Grid_Strategy;
 /// </summary>
 public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurrentSymbol
 {
-    public enum TradeBias
-    {
-        Off,
-        Long,
-        Short
-    }
+    // Directional bias values. Backed by int + InputParameter variants so Quantower renders a
+    // dropdown reliably (bare enum InputParameters are not shown in the settings dialog).
+    private const int BiasOff = 0;
+    private const int BiasLong = 1;
+    private const int BiasShort = -1;
 
     private enum TradeState
     {
@@ -70,8 +69,13 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
     [InputParameter("Enable live orders", 3)]
     public bool EnableLiveOrders { get; set; }
 
-    [InputParameter("Directional bias", 4)]
-    public TradeBias Bias { get; set; } = TradeBias.Off;
+    [InputParameter("Directional bias", 4, variants: new object[]
+    {
+        "Off", BiasOff,
+        "Long", BiasLong,
+        "Short", BiasShort
+    })]
+    public int Bias { get; set; } = BiasOff;
 
     [InputParameter("Max contracts", 5, minimum: 1, maximum: 20, increment: 1, decimalPlaces: 0)]
     public int MaxContracts { get; set; } = 3;
@@ -338,11 +342,11 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
 
         if (state == TradeState.Flat)
         {
-            string reason = Bias == TradeBias.Off ? "no bias set — idle"
+            string reason = Bias == BiasOff ? "no bias set — idle"
                 : consumed ? "armed & consumed (toggle bias Off->Long/Short to re-arm)"
                 : double.IsNaN(mid) ? "waiting for quotes"
                 : "ready — will enter on next cycle";
-            Log($"Heartbeat: FLAT | bias={Bias} | mid={midStr} | cycles={cycleCount} | {reason}.", StrategyLoggingLevel.Trading);
+            Log($"Heartbeat: FLAT | bias={BiasLabel(Bias)} | mid={midStr} | cycles={cycleCount} | {reason}.", StrategyLoggingLevel.Trading);
             return;
         }
 
@@ -356,7 +360,7 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
 
     private void TryEnterBase()
     {
-        if (Bias == TradeBias.Off)
+        if (Bias == BiasOff)
         {
             consumed = false;
             return;
@@ -368,7 +372,7 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
         if (double.IsNaN(Mid()))
             return;
 
-        Side side = Bias == TradeBias.Long ? Side.Buy : Side.Sell;
+        Side side = Bias == BiasLong ? Side.Buy : Side.Sell;
         if (!PlaceMarket(side, 1, "BASE"))
             return;
 
@@ -377,8 +381,11 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
         entryPendingCycles = 0;
         consumed = true;
         baseEntryCount++;
-        Log($"Base entry fired: {side} 1 ({Bias}).", StrategyLoggingLevel.Trading);
+        Log($"Base entry fired: {side} 1 ({BiasLabel(Bias)}).", StrategyLoggingLevel.Trading);
     }
+
+    private static string BiasLabel(int bias)
+        => bias == BiasLong ? "Long" : bias == BiasShort ? "Short" : "Off";
 
     private void InitializeFromPosition(Position pos)
     {

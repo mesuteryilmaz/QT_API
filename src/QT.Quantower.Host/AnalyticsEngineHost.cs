@@ -41,6 +41,7 @@ public sealed class AnalyticsEngineHost
     private long sequence;
     private bool initialized;
     private long queueOverflowCount;
+    private long pendingOverflowRecoveryTicks;
     private int mboCoverageEvents;
     private int mboRealIdEvents;
     private bool mboCoveragePending;
@@ -68,9 +69,9 @@ public sealed class AnalyticsEngineHost
         mboCoverageEvents = 0;
         mboRealIdEvents = 0;
         mboCoveragePending = config.PreferMbo;
+        initialized = true;
         symbol.NewLast += OnNewLast;
         symbol.NewLevel2 += OnNewLevel2;
-        initialized = true;
 
         SeedInitialSnapshot();
 
@@ -194,9 +195,7 @@ public sealed class AnalyticsEngineHost
         if (!queue.TryAdd(evt))
         {
             Interlocked.Increment(ref queueOverflowCount);
-            runtime?.MarkBufferOverflow(evt.ReceiveTimeUtc, "Quantower adapter queue overflow");
-            while (queue.TryTake(out _)) { }
-            SeedInitialSnapshot();
+            Interlocked.Exchange(ref pendingOverflowRecoveryTicks, evt.ReceiveTimeUtc.Ticks);
         }
     }
 
@@ -211,8 +210,14 @@ public sealed class AnalyticsEngineHost
         {
             while (!token.IsCancellationRequested && !queue.IsCompleted)
             {
+                if (TryRecoverFromOverflow(ref lastPublishTicks))
+                    continue;
+
                 if (queue.TryTake(out var evt, 10, token))
                 {
+                    if (TryRecoverFromOverflow(ref lastPublishTicks))
+                        continue;
+
                     try
                     {
                         runtime.OnMarketEvent(evt);
@@ -254,6 +259,32 @@ public sealed class AnalyticsEngineHost
         {
             log("[QT_API V2] Analytics worker error: " + ex, LoggingLevel.Error);
         }
+    }
+
+    private bool TryRecoverFromOverflow(ref long lastPublishTicks)
+    {
+        if (queue == null || runtime == null)
+            return false;
+
+        long ticks = Interlocked.Exchange(ref pendingOverflowRecoveryTicks, 0);
+        if (ticks == 0)
+            return false;
+
+        DateTime eventTime = ticks > 0 ? new DateTime(ticks, DateTimeKind.Utc) : DateTime.UtcNow;
+        try
+        {
+            runtime.MarkBufferOverflow(eventTime, "Quantower adapter queue overflow");
+            while (queue.TryTake(out _)) { }
+            SeedInitialSnapshot();
+            lastPublishTicks = DateTime.UtcNow.Ticks;
+            log("[QT_API V2] Queue overflow recovered on analytics worker thread.", LoggingLevel.System);
+        }
+        catch (Exception ex)
+        {
+            log("[QT_API V2] Queue overflow recovery error: " + ex, LoggingLevel.Error);
+        }
+
+        return true;
     }
 
     private void TrackMboCoverage(NormalizedMarketEvent evt)

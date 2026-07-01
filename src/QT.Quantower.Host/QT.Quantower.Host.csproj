@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    Shared Quantower feed adapter (AnalyticsEngineHost). Referenced by BOTH the analytics indicator
+    and the strategy host so there is one canonical copy of the host + its QT_API.V2.* dependency
+    closure. This removes the stale simple-name assembly binding that previously crashed Quantower
+    (MissingMethodException on AnalyticsEngineHost.CurrentSnapshot). Build the whole solution so every
+    Quantower script folder receives identical DLLs, and fully restart Quantower after deploying.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <AssemblyName>QT_API.V2.QuantowerHost</AssemblyName>
+    <Version>2.0.0</Version>
+    <AssemblyVersion>2.0.0.0</AssemblyVersion>
+    <FileVersion>2.0.0.0</FileVersion>
+    <RootNamespace>MBO_Market_Data_Analytics</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="TradingPlatform.BusinessLayer">
+      <HintPath>C:\Quantower\TradingPlatform\v1.146.13\bin\TradingPlatform.BusinessLayer.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\QT.Core\QT.Core.csproj" />
+    <ProjectReference Include="..\QT.Market\QT.Market.csproj" />
+    <ProjectReference Include="..\QT.Features\QT.Features.csproj" />
+    <ProjectReference Include="..\QT.Storage\QT.Storage.csproj" />
+    <ProjectReference Include="..\QT.Runtime\QT.Runtime.csproj" />
+  </ItemGroup>
+</Project>

@@ -25,15 +25,15 @@
     <ProjectReference Include="src\QT.Features\QT.Features.csproj" />
     <ProjectReference Include="src\QT.Storage\QT.Storage.csproj" />
     <ProjectReference Include="src\QT.Runtime\QT.Runtime.csproj" />
+    <ProjectReference Include="src\QT.Quantower.Host\QT.Quantower.Host.csproj" />
   </ItemGroup>
   <ItemGroup>
-    <Compile Include="src\QT.Quantower\Settings\BuildInfo.cs" />
-    <Compile Include="src\QT.Quantower\Host\AnalyticsEngineHost.cs" />
     <Compile Include="src\QT.Quantower\Panel\DataAnalyticsIndicator.cs" />
   </ItemGroup>
   <Target Name="PostBuild" AfterTargets="PostBuildEvent">
     <ItemGroup>
       <QuantowerScriptDlls Include="$(OutputPath)$(AssemblyName).dll" />
+      <QuantowerScriptDlls Include="$(OutputPath)QT_API.V2.QuantowerHost.dll" />
       <QuantowerScriptDlls Include="$(OutputPath)QT_API.V2.Core.dll" />
       <QuantowerScriptDlls Include="$(OutputPath)QT_API.V2.Market.dll" />
       <QuantowerScriptDlls Include="$(OutputPath)QT_API.V2.Features.dll" />
@@ -41,6 +41,5 @@
       <QuantowerScriptDlls Include="$(OutputPath)QT_API.V2.Runtime.dll" />
     </ItemGroup>
     <Copy SourceFiles="@(QuantowerScriptDlls)" DestinationFolder="C:\Quantower\Settings\Scripts\Indicators\" SkipUnchangedFiles="false" />
-    <Copy SourceFiles="@(QuantowerScriptDlls)" DestinationFolder="C:\Quantower\Settings\Scripts\Strategies\" SkipUnchangedFiles="false" />
   </Target>
 </Project>

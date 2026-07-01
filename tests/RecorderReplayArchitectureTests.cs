@@ -17,8 +17,10 @@ namespace MBO_Market_Data_Analytics.Tests
             Console.WriteLine("Recorder / replay / architecture:");
             RecorderIncludesSchemaAndHash();
             UnavailableValuesNotSerializedAsZero();
+            FeatureQualitySuppressesUnavailableAndStaleZeros();
             ReplayUsesSameRuntimePath();
             RuntimeHonorsFeatureCadence();
+            QuantowerOverflowRecoveryStaysOffCallbackThread();
             FeatureProjectsDoNotReferenceQuantower();
             RuntimeDoesNotReferenceBrokerOrderMethods();
             QuantowerHostDoesNotCompileStrategy();
@@ -58,6 +60,41 @@ namespace MBO_Market_Data_Analytics.Tests
             TestHarness.IsTrue(line != null, "floating-pair unavailable line exists");
             TestHarness.IsTrue(line!.Contains("Unavailable"), "quality is Unavailable");
             TestHarness.IsTrue(!line.Contains("fp.confirmed,Confirmed Floating Pairs,0,"), "numeric field is empty, not zero");
+        }
+
+        private static void FeatureQualitySuppressesUnavailableAndStaleZeros()
+        {
+            TestHarness.Begin("unavailable and stale feature values are not numeric zero");
+            var runtime = new AnalyticsRuntime(Config(""));
+            runtime.Start(T);
+
+            var initial = runtime.Current.Features.Values;
+            AssertNotNumeric(initial, "book.spread_ticks");
+            AssertNotNumeric(initial, "book.mbo_identity");
+            AssertNotNumeric(initial, "market.activity_score");
+            AssertNotNumeric(initial, "market.volatility_score");
+            AssertNotNumeric(initial, "market.liquidity_stress");
+            AssertNotNumeric(initial, "market.confidence");
+            AssertNotNumeric(initial, "spread.mean_30s");
+            AssertNotNumeric(initial, "spread.widen_rate_sec");
+            AssertNotNumeric(initial, "liquidity.cancel_pressure");
+            AssertNotNumeric(initial, "activity.bbo_changes_sec");
+            AssertNotNumeric(initial, "vol.mid_range_5s");
+            AssertNotNumeric(initial, "fp.eligible_large_bids");
+
+            runtime.BeginSnapshot(T, BookMode.Mbp);
+            runtime.ApplySnapshotLevel(T, BookSide.Bid, 400, 10);
+            runtime.ApplySnapshotLevel(T, BookSide.Ask, 401, 10);
+            runtime.EndSnapshot(T, T);
+            TestHarness.IsTrue(runtime.Current.Features.Values["book.spread_ticks"].IsNumeric, "valid spread is numeric");
+
+            runtime.AdvanceTime(T.AddSeconds(10));
+            var stale = runtime.Current.Features.Values;
+            TestHarness.IsTrue(stale["book.spread_ticks"].Quality == MetricQuality.Stale, "stale spread quality");
+            AssertNotNumeric(stale, "book.spread_ticks");
+            AssertNotNumeric(stale, "market.activity_score");
+            AssertNotNumeric(stale, "activity.book_events_sec");
+            runtime.Stop();
         }
 
         private static void ReplayUsesSameRuntimePath()
@@ -105,6 +142,23 @@ namespace MBO_Market_Data_Analytics.Tests
             runtime.AdvanceTime(T.AddSeconds(2));
             TestHarness.IsTrue(runtime.Current.Features.Sequence > validSequence, "cadence tick publishes latest book");
             runtime.Stop();
+        }
+
+        private static void QuantowerOverflowRecoveryStaysOffCallbackThread()
+        {
+            TestHarness.Begin("Quantower overflow recovery is worker-owned");
+            string host = File.ReadAllText(Path.Combine(Root(), "src", "QT.Quantower.Host", "AnalyticsEngineHost.cs"));
+            int enqueueStart = host.IndexOf("private void Enqueue", StringComparison.Ordinal);
+            int loopStart = host.IndexOf("private void ProcessLoop", StringComparison.Ordinal);
+            TestHarness.IsTrue(enqueueStart >= 0 && loopStart > enqueueStart, "host source layout found");
+            string enqueue = host.Substring(enqueueStart, loopStart - enqueueStart);
+            TestHarness.IsTrue(!enqueue.Contains("MarkBufferOverflow", StringComparison.Ordinal), "callback enqueue does not touch runtime recovery");
+            TestHarness.IsTrue(!enqueue.Contains("SeedInitialSnapshot", StringComparison.Ordinal), "callback enqueue does not seed snapshots");
+            TestHarness.IsTrue(enqueue.Contains("pendingOverflowRecoveryTicks", StringComparison.Ordinal), "callback enqueue only signals recovery");
+
+            string recovery = host.Substring(host.IndexOf("private bool TryRecoverFromOverflow", StringComparison.Ordinal));
+            TestHarness.IsTrue(recovery.Contains("MarkBufferOverflow", StringComparison.Ordinal), "worker recovery marks overflow");
+            TestHarness.IsTrue(recovery.Contains("SeedInitialSnapshot", StringComparison.Ordinal), "worker recovery reseeds snapshots");
         }
 
         private static void FeatureProjectsDoNotReferenceQuantower()
@@ -174,6 +228,12 @@ namespace MBO_Market_Data_Analytics.Tests
         {
             string dir = Path.Combine(new[] { Root() }.Concat(parts).ToArray());
             return string.Join("\n", Directory.EnumerateFiles(dir, "*.cs", SearchOption.AllDirectories).Select(File.ReadAllText));
+        }
+
+        private static void AssertNotNumeric(IReadOnlyDictionary<string, FeatureValue> values, string key)
+        {
+            TestHarness.IsTrue(values.TryGetValue(key, out var value), key + " exists");
+            TestHarness.IsTrue(!value.IsNumeric, key + " is not numeric");
         }
 
         private static string Root()

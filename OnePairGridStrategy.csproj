@@ -22,7 +22,7 @@
   <ItemGroup>
     <ProjectReference Include="src\QT.Strategies\QT.Strategies.csproj" />
     <ProjectReference Include="src\QT.Runtime\QT.Runtime.csproj" />
-    <ProjectReference Include="DataAnalytics.csproj" />
+    <ProjectReference Include="src\QT.Quantower.Host\QT.Quantower.Host.csproj" />
   </ItemGroup>
   <ItemGroup>
     <Compile Include="src\QT.Quantower\Strategies\OnePairGridStrategy.cs" />
@@ -32,8 +32,8 @@
     <ItemGroup>
       <QuantowerStrategyDlls Include="$(OutputPath)$(AssemblyName).dll" />
       <QuantowerStrategyDlls Include="$(OutputPath)QT_API.V2.Strategies.dll" />
-      <!-- Analytics host + its support assemblies power the advisor gate at runtime. -->
-      <QuantowerStrategyDlls Include="$(OutputPath)MBO_Market_Data_Analytics.dll" />
+      <!-- Shared analytics host + its support assemblies (no dependency on the indicator DLL). -->
+      <QuantowerStrategyDlls Include="$(OutputPath)QT_API.V2.QuantowerHost.dll" />
       <QuantowerStrategyDlls Include="$(OutputPath)QT_API.V2.Core.dll" />
       <QuantowerStrategyDlls Include="$(OutputPath)QT_API.V2.Market.dll" />
       <QuantowerStrategyDlls Include="$(OutputPath)QT_API.V2.Features.dll" />

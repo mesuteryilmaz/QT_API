@@ -29,6 +29,8 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
         InTrade
     }
 
+    private readonly record struct MidSample(DateTime TimeUtc, double Mid);
+
     private readonly object sync = new();
     private System.Threading.Timer? timer;
 
@@ -40,7 +42,8 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
     private double baseEntryPrice;
     private double lastAddPrice;
     private double highWaterPrice;
-    private double hardStopPrice;
+    private DateTime? softBreachStartUtc;
+    private readonly Queue<MidSample> midWindow = new();
 
     private Order? stopOrder;
     private string? stopOrderId;
@@ -99,6 +102,21 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
     [InputParameter("Trail update step ticks", 11, minimum: 1, maximum: 500, increment: 1, decimalPlaces: 0)]
     public int TrailUpdateTicks { get; set; } = 4;
 
+    [InputParameter("Volatility-scaled stops", 12)]
+    public bool EnableVolatilityScaling { get; set; } = true;
+
+    [InputParameter("Volatility lookback (sec)", 13, minimum: 5, maximum: 600, increment: 5, decimalPlaces: 0)]
+    public int VolLookbackSeconds { get; set; } = 30;
+
+    [InputParameter("Hard-stop vol multiple", 14, minimum: 0.1, maximum: 20, increment: 0.1, decimalPlaces: 1)]
+    public double VolStopMultiple { get; set; } = 2.0;
+
+    [InputParameter("Soft-trail vol multiple", 15, minimum: 0.1, maximum: 20, increment: 0.1, decimalPlaces: 1)]
+    public double VolTrailMultiple { get; set; } = 1.0;
+
+    [InputParameter("Soft-exit persistence (ms)", 16, minimum: 0, maximum: 10000, increment: 50, decimalPlaces: 0)]
+    public int SoftExitPersistenceMs { get; set; } = 750;
+
     public override string[] MonitoringConnectionsIds
     {
         get
@@ -135,7 +153,8 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
             baseEntryPrice = 0;
             lastAddPrice = 0;
             highWaterPrice = 0;
-            hardStopPrice = 0;
+            softBreachStartUtc = null;
+            midWindow.Clear();
             stopOrder = null;
             stopOrderId = null;
             lastStopModifyUtc = DateTime.MinValue;
@@ -295,6 +314,7 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
                 return;
 
             cycleCount++;
+            PushMid(Mid());
             if (cycleCount % heartbeatEveryCycles == 0)
                 LogHeartbeat();
 
@@ -337,6 +357,7 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
             UpdateHighWater();
             MaybeAdd(pos);
             UpdateProtectiveStop();
+            CheckSoftExit();
         }
     }
 
@@ -360,7 +381,9 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
         string stopStr = stopOrder != null && IsOpen(stopOrder)
             ? stopOrder.TriggerPrice.ToString("0.##", CultureInfo.InvariantCulture)
             : "none";
-        Log($"Heartbeat: IN-TRADE {positionSide} {qty}/{MaxContracts} | entry={baseEntryPrice.ToString("0.##", CultureInfo.InvariantCulture)} | mid={midStr} | high={highWaterPrice.ToString("0.##", CultureInfo.InvariantCulture)} | stop={stopStr} | cycles={cycleCount}.", StrategyLoggingLevel.Trading);
+        double trailDist = TrailDistTicks() * CurrentSymbol.TickSize;
+        double softLevel = positionSide == Side.Buy ? highWaterPrice - trailDist : highWaterPrice + trailDist;
+        Log($"Heartbeat: IN-TRADE {positionSide} {qty}/{MaxContracts} | entry={baseEntryPrice.ToString("0.##", CultureInfo.InvariantCulture)} | mid={midStr} | high={highWaterPrice.ToString("0.##", CultureInfo.InvariantCulture)} | bStop={stopStr} | soft={softLevel.ToString("0.##", CultureInfo.InvariantCulture)} | noise={NoiseTicks():0.#}t | cycles={cycleCount}.", StrategyLoggingLevel.Trading);
     }
 
     private void TryEnterBase()
@@ -394,17 +417,59 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
 
     private void InitializeFromPosition(Position pos)
     {
-        double tick = CurrentSymbol.TickSize;
         positionSide = pos.Side;
         baseEntryPrice = pos.OpenPrice;
         lastAddPrice = baseEntryPrice;
         highWaterPrice = baseEntryPrice;
-        hardStopPrice = positionSide == Side.Buy
-            ? baseEntryPrice - StopLossTicks * tick
-            : baseEntryPrice + StopLossTicks * tick;
+        softBreachStartUtc = null;
         initialized = true;
-        Log($"In trade: {positionSide} {Math.Abs(pos.Quantity)} @ {baseEntryPrice}; hard SL {hardStopPrice}.", StrategyLoggingLevel.Trading);
+        Log($"In trade: {positionSide} {Math.Abs(pos.Quantity)} @ {baseEntryPrice}; hardDist={HardDistTicks():0.#}t soft={TrailDistTicks():0.#}t noise={NoiseTicks():0.#}t.", StrategyLoggingLevel.Trading);
         UpdateProtectiveStop();
+    }
+
+    // --- Internal volatility (rolling mid range, in ticks) ---------------------------------------
+
+    private void PushMid(double mid)
+    {
+        if (double.IsNaN(mid))
+            return;
+
+        var now = Core.Instance.TimeUtils.DateTimeUtcNow;
+        midWindow.Enqueue(new MidSample(now, mid));
+        var cutoff = now - TimeSpan.FromSeconds(Math.Max(5, VolLookbackSeconds));
+        while (midWindow.Count > 0 && midWindow.Peek().TimeUtc < cutoff)
+            midWindow.Dequeue();
+    }
+
+    private double NoiseTicks()
+    {
+        if (midWindow.Count < 3)
+            return double.NaN;
+
+        double min = double.MaxValue, max = double.MinValue;
+        foreach (var s in midWindow)
+        {
+            if (s.Mid < min) min = s.Mid;
+            if (s.Mid > max) max = s.Mid;
+        }
+
+        return (max - min) / CurrentSymbol.TickSize;
+    }
+
+    private double HardDistTicks()
+    {
+        if (!EnableVolatilityScaling)
+            return StopLossTicks;
+        double noise = NoiseTicks();
+        return double.IsNaN(noise) ? StopLossTicks : Math.Max(StopLossTicks, VolStopMultiple * noise);
+    }
+
+    private double TrailDistTicks()
+    {
+        if (!EnableVolatilityScaling)
+            return TrailTicks;
+        double noise = NoiseTicks();
+        return double.IsNaN(noise) ? TrailTicks : Math.Max(TrailTicks, VolTrailMultiple * noise);
     }
 
     private void UpdateHighWater()
@@ -455,9 +520,13 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
 
         double tick = CurrentSymbol.TickSize;
         int qty = Math.Max(1, (int)Math.Round(Math.Abs(pos.Quantity)));
+        // Broker stop is the WIDE disaster/backstop at the (vol-scaled) hard distance, trailing only
+        // in the favorable direction. The tighter profit-taking exit is the soft, persistence-filtered
+        // trail in CheckSoftExit — so the broker stop rarely gets wicked.
+        double hardDist = HardDistTicks() * tick;
         double desired = positionSide == Side.Buy
-            ? Math.Max(hardStopPrice, highWaterPrice - TrailTicks * tick)
-            : Math.Min(hardStopPrice, highWaterPrice + TrailTicks * tick);
+            ? highWaterPrice - hardDist
+            : highWaterPrice + hardDist;
         desired = CurrentSymbol.RoundPriceToTickSize(desired);
         Side closeSide = positionSide == Side.Buy ? Side.Sell : Side.Buy;
 
@@ -494,6 +563,37 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
             ModifyStop(stopOrder, qty, desired);
             lastStopModifyUtc = Core.Instance.TimeUtils.DateTimeUtcNow;
         }
+    }
+
+    /// <summary>
+    /// Soft, persistence-filtered trailing exit. Price must hold beyond the (vol-scaled) soft trail
+    /// for <see cref="SoftExitPersistenceMs"/> before flattening; a wick that reverts within the
+    /// window resets the timer, so a brief stop-hunt sweep does not exit. The wide broker stop remains
+    /// as the disaster backstop.
+    /// </summary>
+    private void CheckSoftExit()
+    {
+        double mid = Mid();
+        if (double.IsNaN(mid))
+            return;
+
+        double trailDist = TrailDistTicks() * CurrentSymbol.TickSize;
+        double softLevel = positionSide == Side.Buy
+            ? highWaterPrice - trailDist
+            : highWaterPrice + trailDist;
+
+        bool breached = positionSide == Side.Buy ? mid < softLevel : mid > softLevel;
+        var now = Core.Instance.TimeUtils.DateTimeUtcNow;
+
+        if (!breached)
+        {
+            softBreachStartUtc = null; // reverted within window — wick/hunt dodged
+            return;
+        }
+
+        softBreachStartUtc ??= now;
+        if (now - softBreachStartUtc.Value >= TimeSpan.FromMilliseconds(Math.Max(0, SoftExitPersistenceMs)))
+            FlattenAll($"soft trail confirmed: held beyond {softLevel:0.##} for {SoftExitPersistenceMs}ms");
     }
 
     private bool PlaceMarket(Side side, double quantity, string tag)
@@ -624,7 +724,7 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
         baseEntryPrice = 0;
         lastAddPrice = 0;
         highWaterPrice = 0;
-        hardStopPrice = 0;
+        softBreachStartUtc = null;
         stopOrder = null;
         stopOrderId = null;
         Log($"Flat ({reason}). Set bias to Off then Long/Short to re-arm.", StrategyLoggingLevel.Trading);

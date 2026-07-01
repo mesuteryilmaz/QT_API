@@ -54,6 +54,7 @@ namespace MBO_Market_Data_Analytics.Tests
                 ExecutionCoreReconcileTests.RunAll();
                 PairedQuoteDetectorTests.RunAll();
                 MarketStateMonitorTests.RunAll();
+                OrderFlowMonitorTests.RunAll();
                 OnePairGridQuoteEngineTests.RunAll();
                 RegimeGatedAdvisorTests.RunAll();
                 RecorderReplayArchitectureTests.RunAll();

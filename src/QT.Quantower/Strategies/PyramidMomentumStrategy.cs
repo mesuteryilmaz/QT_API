@@ -3,17 +3,22 @@ using System.Collections.Generic;
 using System.Diagnostics.Metrics;
 using System.Globalization;
 using System.Linq;
+using MBO_Market_Data_Analytics;
+using QT.Core.Quality;
+using QT.Features.MarketState;
+using QT.Features.OrderFlow;
+using QT.Runtime.AnalyticsRuntime;
 using TradingPlatform.BusinessLayer;
 
 namespace MBO_OnePair_Grid_Strategy;
 
 /// <summary>
-/// Anti-martingale (pyramiding) momentum strategy. A manual directional bias fires an aggressive
-/// market entry; the position adds one lot per favorable step up to a hard exposure cap, and the
-/// whole stack is protected by a single ratcheting trailing stop plus a base hard stop. It never
-/// averages down — adds happen only in profit. Direction is intentionally manual. Deliberately
-/// self-contained: it takes no dependency on the analytics/indicator assembly, so it cannot bind
-/// to a stale shared-assembly copy across Quantower script folders.
+/// Anti-martingale (pyramiding) momentum strategy. Every action — enter, add, soft-exit, flatten —
+/// carries an evidence reason drawn from the V2 analytics: entry direction from the order-flow
+/// signal (or manual bias), risk gating from the market regime, and a wide hard stop as the
+/// evidence-independent disaster backstop. Adds happen only in profit; it never averages down.
+/// It consumes analytics through the shared QT_API.V2.QuantowerHost assembly (no dependency on the
+/// indicator DLL), so it cannot bind to a stale cross-folder copy.
 /// </summary>
 public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurrentSymbol
 {
@@ -22,6 +27,10 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
     private const int BiasOff = 0;
     private const int BiasLong = 1;
     private const int BiasShort = -1;
+
+    // Entry-direction source.
+    private const int EntryManual = 0;
+    private const int EntrySignal = 1;
 
     private enum TradeState
     {
@@ -32,6 +41,7 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
     private readonly record struct MidSample(DateTime TimeUtc, double Mid);
 
     private readonly object sync = new();
+    private AnalyticsEngineHost? analytics;
     private System.Threading.Timer? timer;
 
     private TradeState state = TradeState.Flat;
@@ -60,6 +70,7 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
     private int flattenCount;
     private int heartbeatEveryCycles = 40;
     private DateTime lastStopModifyUtc = DateTime.MinValue;
+    private DateTime lastFlatUtc = DateTime.MinValue;
 
     [InputParameter("Symbol", 0)]
     public Symbol CurrentSymbol { get; set; } = null!;
@@ -117,6 +128,31 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
     [InputParameter("Soft-exit persistence (ms)", 16, minimum: 0, maximum: 10000, increment: 50, decimalPlaces: 0)]
     public int SoftExitPersistenceMs { get; set; } = 750;
 
+    [InputParameter("Entry direction source", 17, variants: new object[]
+    {
+        "Manual bias", EntryManual,
+        "Order-flow signal", EntrySignal
+    })]
+    public int EntryMode { get; set; } = EntryManual;
+
+    [InputParameter("Use analytics (evidence + risk)", 18)]
+    public bool EnableAnalytics { get; set; } = true;
+
+    [InputParameter("Analytics prefer MBO", 19)]
+    public bool AnalyticsPreferMbo { get; set; } = true;
+
+    [InputParameter("Min signal confidence", 20, minimum: 0.0, maximum: 1.0, increment: 0.05, decimalPlaces: 2)]
+    public double MinSignalConfidence { get; set; } = 0.50;
+
+    [InputParameter("Flatten on regime risk-off", 21)]
+    public bool FlattenOnRiskOff { get; set; } = true;
+
+    [InputParameter("Require flow support for adds", 22)]
+    public bool RequireFlowForAdds { get; set; } = true;
+
+    [InputParameter("Signal re-entry cooldown (sec)", 23, minimum: 0, maximum: 600, increment: 1, decimalPlaces: 0)]
+    public int ReentryCooldownSec { get; set; } = 5;
+
     public override string[] MonitoringConnectionsIds
     {
         get
@@ -158,6 +194,7 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
             stopOrder = null;
             stopOrderId = null;
             lastStopModifyUtc = DateTime.MinValue;
+            lastFlatUtc = DateTime.MinValue;
             cycleCount = 0;
             baseEntryCount = 0;
             addCount = 0;
@@ -195,10 +232,32 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
 
         SubscribeCoreEvents();
 
+        bool needAnalytics = EnableAnalytics || EntryMode == EntrySignal;
+        if (needAnalytics)
+        {
+            try
+            {
+                analytics = new AnalyticsEngineHost(CurrentSymbol, new AnalyticsEngineConfig { PreferMbo = AnalyticsPreferMbo }, MapAnalyticsLog);
+                analytics.Start();
+                Log("Analytics started: entry/adds/exits are evidence-gated by regime + order-flow.", StrategyLoggingLevel.Trading);
+            }
+            catch (Exception ex)
+            {
+                analytics = null;
+                if (EntryMode == EntrySignal)
+                {
+                    Halt($"analytics failed to start and entry mode is signal-driven: {ex.Message}");
+                    return;
+                }
+                Log($"Analytics failed to start ({ex.Message}); continuing on manual bias with no evidence gating.", StrategyLoggingLevel.Error);
+            }
+        }
+
         int period = Math.Max(50, RefreshMs);
         heartbeatEveryCycles = Math.Max(1, 10000 / period);
         timer = new System.Threading.Timer(_ => OnTimer(), null, 0, period);
-        Log($"Started pyramid momentum strategy: maxContracts={MaxContracts}, addStep={AddStepTicks}t, trail={TrailTicks}t, hardSL={StopLossTicks}t, refresh={period}ms. Set 'Directional bias' to Long/Short to enter.");
+        string mode = EntryMode == EntrySignal ? "order-flow signal" : "manual bias";
+        Log($"Started pyramid momentum strategy: entry={mode}, maxContracts={MaxContracts}, addStep={AddStepTicks}t, trail={TrailTicks}t, hardSL={StopLossTicks}t, refresh={period}ms.");
     }
 
     protected override void OnStop()
@@ -216,6 +275,8 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
             Log("Strategy stopped without flattening; existing position and stop remain live at the broker.", StrategyLoggingLevel.Error);
         }
 
+        analytics?.Stop();
+        analytics = null;
         base.OnStop();
     }
 
@@ -225,6 +286,8 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
         timer = null;
         lock (sync)
             FlattenAll("strategy remove");
+        analytics?.Stop();
+        analytics = null;
         UnsubscribeCoreEvents();
         base.OnRemove();
     }
@@ -355,10 +418,26 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
             }
 
             UpdateHighWater();
+            if (CheckRiskOffFlatten())
+                return;
             MaybeAdd(pos);
             UpdateProtectiveStop();
             CheckSoftExit();
         }
+    }
+
+    /// <summary>Evidence-based inventory kill switch: flatten the stack when the regime turns risk-off.</summary>
+    private bool CheckRiskOffFlatten()
+    {
+        if (!FlattenOnRiskOff)
+            return false;
+
+        var ms = AnalyticsSnapshot()?.Features.MarketState;
+        if (ms == null || !IsUsable(ms.Quality) || !IsRiskOff(ms))
+            return false;
+
+        FlattenAll($"regime risk-off: {ms.Regime}/{ms.Risk}");
+        return true;
     }
 
     private void LogHeartbeat()
@@ -366,13 +445,23 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
         double mid = Mid();
         string midStr = double.IsNaN(mid) ? "n/a" : mid.ToString("0.##", CultureInfo.InvariantCulture);
 
+        var snap = AnalyticsSnapshot();
+        var ms = snap?.Features.MarketState;
+        var of = snap?.Features.OrderFlow;
+        string flowStr = of != null && IsUsable(of.Quality) ? $"{of.Bias} {of.Confidence:0.00}" : "n/a";
+        string regimeStr = ms != null && IsUsable(ms.Quality) ? ms.Regime.ToString() : "n/a";
+
         if (state == TradeState.Flat)
         {
-            string reason = Bias == BiasOff ? "no bias set — idle"
-                : consumed ? "armed & consumed (toggle bias Off->Long/Short to re-arm)"
-                : double.IsNaN(mid) ? "waiting for quotes"
+            string reason = EntryMode == EntrySignal
+                ? (of == null || !IsUsable(of.Quality) ? "signal warming"
+                    : of.Bias == DirectionalBias.Neutral ? "signal neutral — waiting"
+                    : of.Confidence < MinSignalConfidence ? "signal below confidence"
+                    : "signal ready — evaluating entry")
+                : Bias == BiasOff ? "no bias set — idle"
+                : consumed ? "armed & consumed (toggle bias to re-arm)"
                 : "ready — will enter on next cycle";
-            Log($"Heartbeat: FLAT | bias={BiasLabel(Bias)} | mid={midStr} | cycles={cycleCount} | {reason}.", StrategyLoggingLevel.Trading);
+            Log($"Heartbeat: FLAT | entry={(EntryMode == EntrySignal ? "signal" : BiasLabel(Bias))} | flow={flowStr} | regime={regimeStr} | mid={midStr} | cycles={cycleCount} | {reason}.", StrategyLoggingLevel.Trading);
             return;
         }
 
@@ -383,33 +472,63 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
             : "none";
         double trailDist = TrailDistTicks() * CurrentSymbol.TickSize;
         double softLevel = positionSide == Side.Buy ? highWaterPrice - trailDist : highWaterPrice + trailDist;
-        Log($"Heartbeat: IN-TRADE {positionSide} {qty}/{MaxContracts} | entry={baseEntryPrice.ToString("0.##", CultureInfo.InvariantCulture)} | mid={midStr} | high={highWaterPrice.ToString("0.##", CultureInfo.InvariantCulture)} | bStop={stopStr} | soft={softLevel.ToString("0.##", CultureInfo.InvariantCulture)} | noise={NoiseTicks():0.#}t | cycles={cycleCount}.", StrategyLoggingLevel.Trading);
+        Log($"Heartbeat: IN-TRADE {positionSide} {qty}/{MaxContracts} | entry={baseEntryPrice.ToString("0.##", CultureInfo.InvariantCulture)} | mid={midStr} | high={highWaterPrice.ToString("0.##", CultureInfo.InvariantCulture)} | bStop={stopStr} | soft={softLevel.ToString("0.##", CultureInfo.InvariantCulture)} | flow={flowStr} | regime={regimeStr} | cycles={cycleCount}.", StrategyLoggingLevel.Trading);
     }
 
     private void TryEnterBase()
     {
-        if (Bias == BiasOff)
-        {
-            consumed = false;
-            return;
-        }
-
-        if (consumed)
-            return; // one trade per arm; set Bias to Off then back to re-arm
-
         if (double.IsNaN(Mid()))
             return;
 
-        Side side = Bias == BiasLong ? Side.Buy : Side.Sell;
+        var snap = AnalyticsSnapshot();
+        MarketStateSnapshot? ms = snap?.Features.MarketState;
+        OrderFlowSnapshot? of = snap?.Features.OrderFlow;
+
+        Side side;
+        string evidence;
+
+        if (EntryMode == EntrySignal)
+        {
+            // Direction from the order-flow signal. No manual arm; each flat cycle re-evaluates.
+            if (of == null || !IsUsable(of.Quality) || of.Bias == DirectionalBias.Neutral)
+                return;
+            if (of.Confidence < MinSignalConfidence)
+                return;
+            if ((Core.Instance.TimeUtils.DateTimeUtcNow - lastFlatUtc).TotalSeconds < ReentryCooldownSec)
+                return; // avoid churn right after an exit
+            side = of.Bias == DirectionalBias.Up ? Side.Buy : Side.Sell;
+            evidence = $"signal {of.Bias} conf={of.Confidence:0.00} [{of.Reason}]";
+        }
+        else
+        {
+            // Manual bias: one trade per arm (toggle Off -> Long/Short to re-arm).
+            if (Bias == BiasOff) { consumed = false; return; }
+            if (consumed) return;
+            side = Bias == BiasLong ? Side.Buy : Side.Sell;
+            evidence = $"manual {BiasLabel(Bias)}";
+        }
+
+        // Evidence-based veto: never enter into a risk-off regime.
+        if (EnableAnalytics && ms != null && IsUsable(ms.Quality))
+        {
+            if (IsRiskOff(ms))
+                return;
+            evidence += $", regime={ms.Regime}/{ms.Risk}";
+        }
+        else
+        {
+            evidence += ", no-analytics";
+        }
+
         if (!PlaceMarket(side, 1, "BASE"))
             return;
 
         state = TradeState.InTrade;
         initialized = false;
         entryPendingCycles = 0;
-        consumed = true;
+        consumed = EntryMode == EntryManual; // signal mode re-arms on its own
         baseEntryCount++;
-        Log($"Base entry fired: {side} 1 ({BiasLabel(Bias)}).", StrategyLoggingLevel.Trading);
+        Log($"Base entry: {side} 1 — evidence: {evidence}.", StrategyLoggingLevel.Trading);
     }
 
     private static string BiasLabel(int bias)
@@ -489,6 +608,10 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
         if (double.IsNaN(mid))
             return;
 
+        var snap = AnalyticsSnapshot();
+        MarketStateSnapshot? ms = snap?.Features.MarketState;
+        OrderFlowSnapshot? of = snap?.Features.OrderFlow;
+
         double tick = CurrentSymbol.TickSize;
         int projected = (int)Math.Round(Math.Abs(pos.Quantity));
 
@@ -502,13 +625,22 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
             if (!reached)
                 break;
 
+            // Evidence gates for pyramiding: don't add into a risk-off regime, and (optionally)
+            // don't add when order flow no longer supports the position side.
+            if (EnableAnalytics && ms != null && IsUsable(ms.Quality) && IsRiskOff(ms))
+                break;
+            if (RequireFlowForAdds && of != null && IsUsable(of.Quality) && FlowOpposes(of, positionSide))
+                break;
+
             if (!PlaceMarket(positionSide, 1, "ADD"))
                 break;
 
             projected++;
             addCount++;
             lastAddPrice = nextLevel;
-            Log($"Pyramid add: {positionSide} 1 at {nextLevel} (target {projected}/{MaxContracts}).", StrategyLoggingLevel.Trading);
+            string ev = ms != null && IsUsable(ms.Quality) ? $"regime={ms.Regime}" : "no-analytics";
+            if (of != null && IsUsable(of.Quality)) ev += $", flow={of.Bias}";
+            Log($"Pyramid add: {positionSide} 1 at {nextLevel} (target {projected}/{MaxContracts}) — {ev}.", StrategyLoggingLevel.Trading);
         }
     }
 
@@ -588,6 +720,15 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
         if (!breached)
         {
             softBreachStartUtc = null; // reverted within window — wick/hunt dodged
+            return;
+        }
+
+        // Order-flow confirmation: if flow has flipped against the position, the breach is evidence-backed
+        // (a real move, not a wick) and we exit immediately instead of waiting out the persistence window.
+        var of = AnalyticsSnapshot()?.Features.OrderFlow;
+        if (of != null && IsUsable(of.Quality) && FlowOpposes(of, positionSide))
+        {
+            FlattenAll($"soft trail + flow reversal {of.Bias} conf={of.Confidence:0.00} beyond {softLevel:0.##}");
             return;
         }
 
@@ -727,8 +868,28 @@ public sealed class PyramidMomentumStrategy : Strategy, ICurrentAccount, ICurren
         softBreachStartUtc = null;
         stopOrder = null;
         stopOrderId = null;
-        Log($"Flat ({reason}). Set bias to Off then Long/Short to re-arm.", StrategyLoggingLevel.Trading);
+        lastFlatUtc = Core.Instance.TimeUtils.DateTimeUtcNow;
+        string rearm = EntryMode == EntrySignal ? "awaiting next order-flow signal" : "toggle bias Off->Long/Short to re-arm";
+        Log($"Flat ({reason}). {rearm}.", StrategyLoggingLevel.Trading);
     }
+
+    // --- Analytics evidence helpers --------------------------------------------------------------
+
+    private AnalyticsRuntimeSnapshot? AnalyticsSnapshot()
+        => analytics != null && analytics.IsInitialized ? analytics.CurrentSnapshot : null;
+
+    private static bool IsUsable(MetricQuality q)
+        => q is MetricQuality.Exact or MetricQuality.Derived;
+
+    private static bool IsRiskOff(MarketStateSnapshot ms)
+        => ms.Regime is MarketRegime.ThinFragile or MarketRegime.VolatileDislocated
+            || ms.Risk == RiskEnvironment.Critical;
+
+    private static bool FlowOpposes(OrderFlowSnapshot of, Side side)
+        => side == Side.Buy ? of.Bias == DirectionalBias.Down : of.Bias == DirectionalBias.Up;
+
+    private void MapAnalyticsLog(string message, LoggingLevel level)
+        => Log(message, level == LoggingLevel.Error ? StrategyLoggingLevel.Error : StrategyLoggingLevel.Info);
 
     private void CancelStop(string reason)
     {

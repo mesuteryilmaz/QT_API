@@ -1,4 +1,11 @@
 <Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    Self-contained single-DLL strategy host. The entire QT analytics + strategy stack and the
+    Quantower host adapter are compiled directly INTO this assembly rather than referenced as separate
+    QT_API.V2.*.dll files, because Quantower's plugin loader does not reliably resolve shared support
+    assemblies across script folders (version-pinned 2.0.0.0 -> stale copies are indistinguishable and
+    cause MissingMethodException at runtime). Deploy ONLY MBO_OnePair_Grid_Strategy.dll.
+  -->
   <PropertyGroup>
     <TargetFramework>net10.0-windows</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
@@ -20,16 +27,13 @@
     </Reference>
   </ItemGroup>
   <ItemGroup>
-    <ProjectReference Include="src\QT.Strategies\QT.Strategies.csproj" />
-    <ProjectReference Include="src\QT.Core\QT.Core.csproj" />
-    <ProjectReference Include="src\QT.Market\QT.Market.csproj" />
-    <ProjectReference Include="src\QT.Features\QT.Features.csproj" />
-    <ProjectReference Include="src\QT.Storage\QT.Storage.csproj" />
-    <ProjectReference Include="src\QT.Runtime\QT.Runtime.csproj" />
-  </ItemGroup>
-  <ItemGroup>
-    <!-- Host source LINKED (embedded) rather than referenced as a shared DLL, so this plugin is
-         self-contained and does not depend on Quantower resolving a cross-plugin support assembly. -->
+    <!-- Entire analytics + strategy stack compiled in-assembly (no external QT_API.V2.*.dll). -->
+    <Compile Include="src\QT.Core\**\*.cs" Exclude="src\QT.Core\obj\**\*.cs;src\QT.Core\bin\**\*.cs" />
+    <Compile Include="src\QT.Market\**\*.cs" Exclude="src\QT.Market\obj\**\*.cs;src\QT.Market\bin\**\*.cs" />
+    <Compile Include="src\QT.Features\**\*.cs" Exclude="src\QT.Features\obj\**\*.cs;src\QT.Features\bin\**\*.cs" />
+    <Compile Include="src\QT.Storage\**\*.cs" Exclude="src\QT.Storage\obj\**\*.cs;src\QT.Storage\bin\**\*.cs" />
+    <Compile Include="src\QT.Runtime\**\*.cs" Exclude="src\QT.Runtime\obj\**\*.cs;src\QT.Runtime\bin\**\*.cs" />
+    <Compile Include="src\QT.Strategies\**\*.cs" Exclude="src\QT.Strategies\obj\**\*.cs;src\QT.Strategies\bin\**\*.cs" />
     <Compile Include="src\QT.Quantower.Host\AnalyticsEngineHost.cs" />
     <Compile Include="src\QT.Quantower.Host\BuildInfo.cs" />
     <Compile Include="src\QT.Quantower\Strategies\OnePairGridStrategy.cs" />
@@ -37,16 +41,8 @@
     <Compile Include="src\QT.Quantower\Strategies\SignalValidationProbe.cs" />
   </ItemGroup>
   <Target Name="PostBuild" AfterTargets="PostBuildEvent">
-    <ItemGroup>
-      <QuantowerStrategyDlls Include="$(OutputPath)$(AssemblyName).dll" />
-      <QuantowerStrategyDlls Include="$(OutputPath)QT_API.V2.Strategies.dll" />
-      <!-- Analytics support assemblies (the host itself is embedded, not a separate DLL). -->
-      <QuantowerStrategyDlls Include="$(OutputPath)QT_API.V2.Core.dll" />
-      <QuantowerStrategyDlls Include="$(OutputPath)QT_API.V2.Market.dll" />
-      <QuantowerStrategyDlls Include="$(OutputPath)QT_API.V2.Features.dll" />
-      <QuantowerStrategyDlls Include="$(OutputPath)QT_API.V2.Storage.dll" />
-      <QuantowerStrategyDlls Include="$(OutputPath)QT_API.V2.Runtime.dll" />
-    </ItemGroup>
-    <Copy SourceFiles="@(QuantowerStrategyDlls)" DestinationFolder="C:\Quantower\Settings\Scripts\Strategies\" SkipUnchangedFiles="false" />
+    <!-- Remove orphaned support DLLs from previous multi-DLL deployments, then deploy the single DLL. -->
+    <Delete Files="C:\Quantower\Settings\Scripts\Strategies\QT_API.V2.Strategies.dll;C:\Quantower\Settings\Scripts\Strategies\QT_API.V2.Core.dll;C:\Quantower\Settings\Scripts\Strategies\QT_API.V2.Market.dll;C:\Quantower\Settings\Scripts\Strategies\QT_API.V2.Features.dll;C:\Quantower\Settings\Scripts\Strategies\QT_API.V2.Storage.dll;C:\Quantower\Settings\Scripts\Strategies\QT_API.V2.Runtime.dll" />
+    <Copy SourceFiles="$(OutputPath)$(AssemblyName).dll" DestinationFolder="C:\Quantower\Settings\Scripts\Strategies\" SkipUnchangedFiles="false" />
   </Target>
 </Project>

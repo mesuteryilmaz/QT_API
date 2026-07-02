@@ -1,4 +1,12 @@
 <Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    Self-contained single-DLL plugin. The entire QT analytics stack (Core/Market/Features/Storage/
+    Runtime) plus the Quantower host adapter are compiled directly INTO this assembly rather than
+    referenced as separate QT_API.V2.*.dll files. Quantower's plugin loader does not reliably resolve
+    shared support assemblies across script folders (they are version-pinned 2.0.0.0, so a stale copy
+    is indistinguishable and produces MissingMethodException at runtime). Shipping one self-contained
+    DLL removes every cross-assembly binding. Deploy ONLY MBO_Market_Data_Analytics.dll.
+  -->
   <PropertyGroup>
     <TargetFramework>net10.0-windows</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
@@ -20,30 +28,19 @@
     </Reference>
   </ItemGroup>
   <ItemGroup>
-    <ProjectReference Include="src\QT.Core\QT.Core.csproj" />
-    <ProjectReference Include="src\QT.Market\QT.Market.csproj" />
-    <ProjectReference Include="src\QT.Features\QT.Features.csproj" />
-    <ProjectReference Include="src\QT.Storage\QT.Storage.csproj" />
-    <ProjectReference Include="src\QT.Runtime\QT.Runtime.csproj" />
-  </ItemGroup>
-  <ItemGroup>
-    <!-- Host source is single-sourced under src\QT.Quantower.Host but LINKED (embedded) into this
-         plugin rather than referenced as a separate DLL: Quantower's per-plugin loader does not
-         reliably resolve a shared cross-plugin support assembly, which caused a MissingMethodException
-         on AnalyticsEngineHost.CurrentSnapshot. Embedding keeps each plugin self-contained. -->
+    <!-- Entire analytics stack compiled in-assembly (no external QT_API.V2.*.dll). -->
+    <Compile Include="src\QT.Core\**\*.cs" Exclude="src\QT.Core\obj\**\*.cs;src\QT.Core\bin\**\*.cs" />
+    <Compile Include="src\QT.Market\**\*.cs" Exclude="src\QT.Market\obj\**\*.cs;src\QT.Market\bin\**\*.cs" />
+    <Compile Include="src\QT.Features\**\*.cs" Exclude="src\QT.Features\obj\**\*.cs;src\QT.Features\bin\**\*.cs" />
+    <Compile Include="src\QT.Storage\**\*.cs" Exclude="src\QT.Storage\obj\**\*.cs;src\QT.Storage\bin\**\*.cs" />
+    <Compile Include="src\QT.Runtime\**\*.cs" Exclude="src\QT.Runtime\obj\**\*.cs;src\QT.Runtime\bin\**\*.cs" />
     <Compile Include="src\QT.Quantower.Host\AnalyticsEngineHost.cs" />
     <Compile Include="src\QT.Quantower.Host\BuildInfo.cs" />
     <Compile Include="src\QT.Quantower\Panel\DataAnalyticsIndicator.cs" />
   </ItemGroup>
   <Target Name="PostBuild" AfterTargets="PostBuildEvent">
-    <ItemGroup>
-      <QuantowerScriptDlls Include="$(OutputPath)$(AssemblyName).dll" />
-      <QuantowerScriptDlls Include="$(OutputPath)QT_API.V2.Core.dll" />
-      <QuantowerScriptDlls Include="$(OutputPath)QT_API.V2.Market.dll" />
-      <QuantowerScriptDlls Include="$(OutputPath)QT_API.V2.Features.dll" />
-      <QuantowerScriptDlls Include="$(OutputPath)QT_API.V2.Storage.dll" />
-      <QuantowerScriptDlls Include="$(OutputPath)QT_API.V2.Runtime.dll" />
-    </ItemGroup>
-    <Copy SourceFiles="@(QuantowerScriptDlls)" DestinationFolder="C:\Quantower\Settings\Scripts\Indicators\" SkipUnchangedFiles="false" />
+    <!-- Remove orphaned support DLLs from previous multi-DLL deployments, then deploy the single DLL. -->
+    <Delete Files="C:\Quantower\Settings\Scripts\Indicators\QT_API.V2.Core.dll;C:\Quantower\Settings\Scripts\Indicators\QT_API.V2.Market.dll;C:\Quantower\Settings\Scripts\Indicators\QT_API.V2.Features.dll;C:\Quantower\Settings\Scripts\Indicators\QT_API.V2.Storage.dll;C:\Quantower\Settings\Scripts\Indicators\QT_API.V2.Runtime.dll" />
+    <Copy SourceFiles="$(OutputPath)$(AssemblyName).dll" DestinationFolder="C:\Quantower\Settings\Scripts\Indicators\" SkipUnchangedFiles="false" />
   </Target>
 </Project>

@@ -24,10 +24,14 @@
     <ProjectReference Include="src\QT.Core\QT.Core.csproj" />
     <ProjectReference Include="src\QT.Market\QT.Market.csproj" />
     <ProjectReference Include="src\QT.Features\QT.Features.csproj" />
+    <ProjectReference Include="src\QT.Storage\QT.Storage.csproj" />
     <ProjectReference Include="src\QT.Runtime\QT.Runtime.csproj" />
-    <ProjectReference Include="src\QT.Quantower.Host\QT.Quantower.Host.csproj" />
   </ItemGroup>
   <ItemGroup>
+    <!-- Host source LINKED (embedded) rather than referenced as a shared DLL, so this plugin is
+         self-contained and does not depend on Quantower resolving a cross-plugin support assembly. -->
+    <Compile Include="src\QT.Quantower.Host\AnalyticsEngineHost.cs" />
+    <Compile Include="src\QT.Quantower.Host\BuildInfo.cs" />
     <Compile Include="src\QT.Quantower\Strategies\OnePairGridStrategy.cs" />
     <Compile Include="src\QT.Quantower\Strategies\PyramidMomentumStrategy.cs" />
     <Compile Include="src\QT.Quantower\Strategies\SignalValidationProbe.cs" />
@@ -36,8 +40,7 @@
     <ItemGroup>
       <QuantowerStrategyDlls Include="$(OutputPath)$(AssemblyName).dll" />
       <QuantowerStrategyDlls Include="$(OutputPath)QT_API.V2.Strategies.dll" />
-      <!-- Shared analytics host + its support assemblies (no dependency on the indicator DLL). -->
-      <QuantowerStrategyDlls Include="$(OutputPath)QT_API.V2.QuantowerHost.dll" />
+      <!-- Analytics support assemblies (the host itself is embedded, not a separate DLL). -->
       <QuantowerStrategyDlls Include="$(OutputPath)QT_API.V2.Core.dll" />
       <QuantowerStrategyDlls Include="$(OutputPath)QT_API.V2.Market.dll" />
       <QuantowerStrategyDlls Include="$(OutputPath)QT_API.V2.Features.dll" />

@@ -25,15 +25,19 @@
     <ProjectReference Include="src\QT.Features\QT.Features.csproj" />
     <ProjectReference Include="src\QT.Storage\QT.Storage.csproj" />
     <ProjectReference Include="src\QT.Runtime\QT.Runtime.csproj" />
-    <ProjectReference Include="src\QT.Quantower.Host\QT.Quantower.Host.csproj" />
   </ItemGroup>
   <ItemGroup>
+    <!-- Host source is single-sourced under src\QT.Quantower.Host but LINKED (embedded) into this
+         plugin rather than referenced as a separate DLL: Quantower's per-plugin loader does not
+         reliably resolve a shared cross-plugin support assembly, which caused a MissingMethodException
+         on AnalyticsEngineHost.CurrentSnapshot. Embedding keeps each plugin self-contained. -->
+    <Compile Include="src\QT.Quantower.Host\AnalyticsEngineHost.cs" />
+    <Compile Include="src\QT.Quantower.Host\BuildInfo.cs" />
     <Compile Include="src\QT.Quantower\Panel\DataAnalyticsIndicator.cs" />
   </ItemGroup>
   <Target Name="PostBuild" AfterTargets="PostBuildEvent">
     <ItemGroup>
       <QuantowerScriptDlls Include="$(OutputPath)$(AssemblyName).dll" />
-      <QuantowerScriptDlls Include="$(OutputPath)QT_API.V2.QuantowerHost.dll" />
       <QuantowerScriptDlls Include="$(OutputPath)QT_API.V2.Core.dll" />
       <QuantowerScriptDlls Include="$(OutputPath)QT_API.V2.Market.dll" />
       <QuantowerScriptDlls Include="$(OutputPath)QT_API.V2.Features.dll" />
